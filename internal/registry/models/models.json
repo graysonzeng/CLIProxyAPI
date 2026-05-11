@@ -2064,5 +2064,130 @@
         ]
       }
     }
+  ],
+  "kiro": [
+    {
+      "id": "claude-sonnet-4-5",
+      "object": "model",
+      "created": 1759104000,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude 4.5 Sonnet (Kiro)",
+      "context_length": 200000,
+      "max_completion_tokens": 64000,
+      "thinking": {
+        "min": 1024,
+        "max": 24576,
+        "zero_allowed": true
+      }
+    },
+    {
+      "id": "claude-sonnet-4-5-20250929",
+      "object": "model",
+      "created": 1759104000,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude 4.5 Sonnet (Kiro, 20250929)",
+      "context_length": 200000,
+      "max_completion_tokens": 64000,
+      "thinking": {
+        "min": 1024,
+        "max": 24576,
+        "zero_allowed": true
+      }
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "object": "model",
+      "created": 1771372800,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude 4.6 Sonnet (Kiro)",
+      "context_length": 200000,
+      "max_completion_tokens": 64000,
+      "thinking": {
+        "min": 1024,
+        "max": 24576,
+        "zero_allowed": true,
+        "levels": ["low", "medium", "high"]
+      }
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "object": "model",
+      "created": 1759276800,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude 4.5 Haiku (Kiro)",
+      "context_length": 200000,
+      "max_completion_tokens": 64000,
+      "thinking": {
+        "min": 1024,
+        "max": 24576,
+        "zero_allowed": true
+      }
+    },
+    {
+      "id": "claude-opus-4-5",
+      "object": "model",
+      "created": 1759104000,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude 4.5 Opus (Kiro)",
+      "context_length": 200000,
+      "max_completion_tokens": 64000,
+      "thinking": {
+        "min": 1024,
+        "max": 24576,
+        "zero_allowed": true
+      }
+    },
+    {
+      "id": "claude-opus-4-5-20251101",
+      "object": "model",
+      "created": 1759104000,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude 4.5 Opus (Kiro, 20251101)",
+      "context_length": 200000,
+      "max_completion_tokens": 64000,
+      "thinking": {
+        "min": 1024,
+        "max": 24576,
+        "zero_allowed": true
+      }
+    },
+    {
+      "id": "claude-opus-4-6",
+      "object": "model",
+      "created": 1771372800,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude 4.6 Opus (Kiro)",
+      "context_length": 200000,
+      "max_completion_tokens": 64000,
+      "thinking": {
+        "min": 1024,
+        "max": 24576,
+        "zero_allowed": true,
+        "levels": ["low", "medium", "high"]
+      }
+    },
+    {
+      "id": "claude-opus-4-7",
+      "object": "model",
+      "created": 1771372800,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude 4.7 Opus (Kiro)",
+      "context_length": 1000000,
+      "max_completion_tokens": 64000,
+      "thinking": {
+        "min": 1024,
+        "max": 24576,
+        "zero_allowed": true,
+        "levels": ["low", "medium", "high"]
+      }
+    }
   ]
 }
