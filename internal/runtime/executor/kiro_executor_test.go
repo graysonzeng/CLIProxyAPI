@@ -12,8 +12,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 
+	// Register protocol translators for executor translation regression tests.
+	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
 	// Register Claude thinking provider applier (needed by ApplyThinking tests).
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/claude"
 )
@@ -100,6 +103,27 @@ func TestBuildClaudeMessageJSON_TextOnly(t *testing.T) {
 	text := block["text"].(string)
 	if text != "Hello world" {
 		t.Errorf("expected 'Hello world', got %q", text)
+	}
+}
+
+func TestBuildClaudeMessageSSE_TranslatesToOpenAINonStream(t *testing.T) {
+	raw := `binary{"content": "Hello"}binary{"content": " world"}`
+	claudeSSE := buildClaudeMessageSSE([]byte(raw), nil, "claude-sonnet-4-5")
+
+	var param any
+	result := sdktranslator.TranslateNonStream(
+		context.Background(),
+		sdktranslator.FromString("claude"),
+		sdktranslator.FromString("openai"),
+		"claude-sonnet-4-5",
+		nil,
+		nil,
+		claudeSSE,
+		&param,
+	)
+
+	if got := gjson.GetBytes(result, "choices.0.message.content").String(); got != "Hello world" {
+		t.Fatalf("OpenAI content = %q, want %q; raw=%s", got, "Hello world", string(result))
 	}
 }
 
@@ -219,6 +243,40 @@ func TestStreamKiroToClaudeSSE_TextOnly(t *testing.T) {
 	}
 	if !hasContentDelta {
 		t.Error("expected text_delta event")
+	}
+}
+
+func TestStreamKiroToClaudeSSE_TranslatesToOpenAIChunks(t *testing.T) {
+	raw := `binary{"content": "Hello"}binary{"content": " world"}`
+	reader := strings.NewReader(raw)
+	var param any
+	var content strings.Builder
+	var chunkCount int
+
+	streamKiroToClaudeSSE(nil, reader, nil, "claude-sonnet-4-5", func(line []byte) {
+		for _, dataLine := range claudeSSEDataLines(line) {
+			chunks := sdktranslator.TranslateStream(
+				context.Background(),
+				sdktranslator.FromString("claude"),
+				sdktranslator.FromString("openai"),
+				"claude-sonnet-4-5",
+				nil,
+				nil,
+				dataLine,
+				&param,
+			)
+			for _, chunk := range chunks {
+				chunkCount++
+				content.WriteString(gjson.GetBytes(chunk, "choices.0.delta.content").String())
+			}
+		}
+	})
+
+	if chunkCount == 0 {
+		t.Fatal("expected translated OpenAI chunks")
+	}
+	if got := content.String(); got != "Hello world" {
+		t.Fatalf("OpenAI stream content = %q, want %q", got, "Hello world")
 	}
 }
 

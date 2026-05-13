@@ -241,12 +241,16 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, fmt.Errorf("kiro executor: failed to read response: %w", err)
 	}
 
-	// Parse the non-streaming Kiro response (uses SSE regex parser for full response).
+	// Claude clients expect the Messages API JSON shape for non-streaming responses.
 	claudeJSON := buildClaudeMessageJSON(rawResp, toolNameMaps, baseModel)
+	if from == to {
+		return cliproxyexecutor.Response{Payload: claudeJSON, Headers: httpResp.Header.Clone()}, nil
+	}
 
-	// Translate Claude JSON to the requested output format.
+	// Cross-protocol response translators consume Claude SSE data events.
+	claudeSSE := buildClaudeMessageSSE(rawResp, toolNameMaps, baseModel)
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, body, claudeJSON, &param)
+	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, body, claudeSSE, &param)
 	return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
 }
 
@@ -320,11 +324,13 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			// Other formats: translate each SSE line.
 			var param any
 			streamKiroToClaudeSSE(ctx, httpResp.Body, toolNameMaps, baseModel, func(line []byte) {
-				chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param)
-				for i := range chunks {
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-					case <-ctx.Done():
+				for _, dataLine := range claudeSSEDataLines(line) {
+					chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, dataLine, &param)
+					for i := range chunks {
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+						case <-ctx.Done():
+						}
 					}
 				}
 			})
@@ -919,6 +925,29 @@ func buildClaudeMessageJSON(rawResp []byte, toolNameMaps *helps.KiroToolNameMaps
 	if err != nil {
 		log.Errorf("kiro executor: failed to marshal Claude response: %v", err)
 		return []byte("{}")
+	}
+	return out
+}
+
+func buildClaudeMessageSSE(rawResp []byte, toolNameMaps *helps.KiroToolNameMaps, model string) []byte {
+	var buf bytes.Buffer
+	streamKiroToClaudeSSE(context.Background(), bytes.NewReader(rawResp), toolNameMaps, model, func(line []byte) {
+		buf.Write(line)
+		if !bytes.HasSuffix(line, []byte("\n\n")) {
+			buf.WriteByte('\n')
+		}
+	})
+	return buf.Bytes()
+}
+
+func claudeSSEDataLines(raw []byte) [][]byte {
+	lines := bytes.Split(raw, []byte("\n"))
+	out := make([][]byte, 0, len(lines))
+	for _, line := range lines {
+		line = bytes.TrimSpace(line)
+		if bytes.HasPrefix(line, []byte("data:")) {
+			out = append(out, bytes.Clone(line))
+		}
 	}
 	return out
 }
