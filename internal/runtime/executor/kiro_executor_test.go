@@ -8,10 +8,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 
@@ -20,6 +23,42 @@ import (
 	// Register Claude thinking provider applier (needed by ApplyThinking tests).
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/claude"
 )
+
+type kiroUsageCapture struct {
+	ch chan usage.Record
+}
+
+func (c *kiroUsageCapture) HandleUsage(_ context.Context, record usage.Record) {
+	if record.Provider != "kiro" {
+		return
+	}
+	select {
+	case c.ch <- record:
+	default:
+	}
+}
+
+func registerKiroUsageCapture() *kiroUsageCapture {
+	capture := &kiroUsageCapture{ch: make(chan usage.Record, 16)}
+	usage.RegisterPlugin(capture)
+	return capture
+}
+
+func waitForKiroUsageRecord(t *testing.T, capture *kiroUsageCapture, authID string) usage.Record {
+	t.Helper()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case record := <-capture.ch:
+			if record.AuthID == authID {
+				return record
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for Kiro usage record for auth %q", authID)
+		}
+	}
+}
 
 func TestExtractThinkingFromText(t *testing.T) {
 	tests := []struct {
@@ -370,6 +409,112 @@ func TestKiroExecutorIdentifier(t *testing.T) {
 	e := NewKiroExecutor(nil)
 	if e.Identifier() != "kiro" {
 		t.Errorf("expected identifier 'kiro', got %q", e.Identifier())
+	}
+}
+
+func TestKiroExecutorExecutePublishesSuccessUsage(t *testing.T) {
+	capture := registerKiroUsageCapture()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer at-test" {
+			t.Fatalf("Authorization = %q, want Bearer at-test", got)
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte(`binary{"content":"ok"}`))
+	}))
+	defer server.Close()
+
+	origTemplate := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL
+	defer func() { helps.KiroBaseURLTemplate = origTemplate }()
+
+	authID := "kiro-usage-nonstream"
+	executor := NewKiroExecutor(nil)
+	auth := &cliproxyauth.Auth{
+		ID:       authID,
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken": "at-test",
+			"region":      "us-east-1",
+		},
+	}
+	payload := []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`)
+	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "content.0.text").String(); got != "ok" {
+		t.Fatalf("Execute content = %q, want ok; payload=%s", got, string(resp.Payload))
+	}
+
+	record := waitForKiroUsageRecord(t, capture, authID)
+	if record.Failed {
+		t.Fatalf("usage record Failed = true, want false: %+v", record.Fail)
+	}
+	if record.Provider != "kiro" || record.Model != "claude-sonnet-4-5" {
+		t.Fatalf("usage record provider/model = %s/%s, want kiro/claude-sonnet-4-5", record.Provider, record.Model)
+	}
+}
+
+func TestKiroExecutorExecuteStreamPublishesSuccessUsage(t *testing.T) {
+	capture := registerKiroUsageCapture()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer at-stream" {
+			t.Fatalf("Authorization = %q, want Bearer at-stream", got)
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte(`binary{"content":"stream ok"}`))
+	}))
+	defer server.Close()
+
+	origTemplate := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL
+	defer func() { helps.KiroBaseURLTemplate = origTemplate }()
+
+	authID := "kiro-usage-stream"
+	executor := NewKiroExecutor(nil)
+	auth := &cliproxyauth.Auth{
+		ID:       authID,
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken": "at-stream",
+			"region":      "us-east-1",
+		},
+	}
+	payload := []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var sawContent bool
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream chunk error: %v", chunk.Err)
+		}
+		if strings.Contains(string(chunk.Payload), "stream ok") {
+			sawContent = true
+		}
+	}
+	if !sawContent {
+		t.Fatal("expected stream content chunk containing stream ok")
+	}
+
+	record := waitForKiroUsageRecord(t, capture, authID)
+	if record.Failed {
+		t.Fatalf("usage record Failed = true, want false: %+v", record.Fail)
+	}
+	if record.Provider != "kiro" || record.Model != "claude-sonnet-4-5" {
+		t.Fatalf("usage record provider/model = %s/%s, want kiro/claude-sonnet-4-5", record.Provider, record.Model)
 	}
 }
 

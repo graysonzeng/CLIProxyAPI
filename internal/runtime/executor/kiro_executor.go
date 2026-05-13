@@ -244,6 +244,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	// Claude clients expect the Messages API JSON shape for non-streaming responses.
 	claudeJSON := buildClaudeMessageJSON(rawResp, toolNameMaps, baseModel)
 	if from == to {
+		reporter.EnsurePublished(ctx)
 		return cliproxyexecutor.Response{Payload: claudeJSON, Headers: httpResp.Header.Clone()}, nil
 	}
 
@@ -251,6 +252,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	claudeSSE := buildClaudeMessageSSE(rawResp, toolNameMaps, baseModel)
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, body, claudeSSE, &param)
+	reporter.EnsurePublished(ctx)
 	return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
 }
 
@@ -335,6 +337,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				}
 			})
 		}
+		reporter.EnsurePublished(ctx)
 	}()
 
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
