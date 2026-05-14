@@ -50,6 +50,8 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - Kiro or other provider-related features may reference these local open-source repositories as evidence and design references:
   - `/Users/sheng/tencent/AIClient2API`
   - `/Users/sheng/tencent/kiro.rs`
+- For management API, Web UI, or frontend-related work, reference the management center repository:
+  - `/Users/sheng/tencent/Cli-Proxy-API-Management-Center` — React + TypeScript + Vite single-page Web UI for the Management API (`/v0/management`). Handles config viewing/editing, credential uploads, and log viewing. Ships as a bundled single HTML file embedded in this server via `internal/managementasset/`.
 - Treat reference repositories as inputs, not truth. Check their current source, compare against this repository's architecture, and respect license/attribution requirements before porting code or protocol details.
 - Kiro-specific code currently lives in `internal/runtime/executor/kiro_executor.go`, `internal/runtime/executor/kiro_executor_test.go`, `internal/runtime/executor/helps/kiro_helpers.go`, and `internal/runtime/executor/helps/kiro_helpers_test.go`.
 
