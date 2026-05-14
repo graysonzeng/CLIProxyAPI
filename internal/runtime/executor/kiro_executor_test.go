@@ -3,10 +3,12 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1055,5 +1057,463 @@ func TestKiroThinkingAdaptiveEffort(t *testing.T) {
 	}
 	if !strings.Contains(cwStr, "high") {
 		t.Error("expected effort=high in CodeWhisperer request")
+	}
+}
+
+// --- HIGH-3 (P0-2) error classification + 401 force-refresh-once retry tests ---
+
+// patchKiroEndpoints rewires the Kiro base URL and social refresh URL templates
+// to a single httptest.Server. The Kiro path responds via baseHandler and the
+// refresh path responds via refreshHandler. The returned cleanup function
+// restores the original templates.
+func patchKiroEndpoints(t *testing.T, server *httptest.Server) func() {
+	t.Helper()
+	origBase := helps.KiroBaseURLTemplate
+	origSocial := helps.KiroSocialRefreshURLTemplate
+	helps.KiroBaseURLTemplate = server.URL + "/generateAssistantResponse"
+	helps.KiroSocialRefreshURLTemplate = server.URL + "/refreshToken"
+	return func() {
+		helps.KiroBaseURLTemplate = origBase
+		helps.KiroSocialRefreshURLTemplate = origSocial
+	}
+}
+
+// kiroScript routes Kiro test requests by URL path. Each call to the
+// generateAssistantResponse handler advances the response index so a sequence
+// of upstream replies (e.g. 401 then 200) can be scripted deterministically.
+type kiroScript struct {
+	mainCalls        int32
+	refreshCalls     int32
+	mainResponses    []func(http.ResponseWriter, *http.Request)
+	refreshResponses []func(http.ResponseWriter, *http.Request)
+	t                *testing.T
+}
+
+func (s *kiroScript) handler() http.HandlerFunc {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/generateAssistantResponse"):
+			idx := atomic.AddInt32(&s.mainCalls, 1) - 1
+			if int(idx) >= len(s.mainResponses) {
+				s.t.Fatalf("Kiro main handler received unexpected call #%d (only %d scripted)", idx+1, len(s.mainResponses))
+				return
+			}
+			s.mainResponses[idx](w, r)
+		case strings.HasSuffix(r.URL.Path, "/refreshToken"):
+			idx := atomic.AddInt32(&s.refreshCalls, 1) - 1
+			if int(idx) >= len(s.refreshResponses) {
+				s.t.Fatalf("Kiro refresh handler received unexpected call #%d (only %d scripted)", idx+1, len(s.refreshResponses))
+				return
+			}
+			s.refreshResponses[idx](w, r)
+		default:
+			s.t.Fatalf("Kiro handler received unexpected path: %s", r.URL.Path)
+		}
+	})
+}
+
+func newKiroAuth(authID, accessToken string) *cliproxyauth.Auth {
+	return &cliproxyauth.Auth{
+		ID:       authID,
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken":  accessToken,
+			"refreshToken": "rt-test",
+			"region":       "us-east-1",
+			"authMethod":   helps.KiroAuthMethodSocial,
+		},
+	}
+}
+
+func successKiroResponse(body string) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+	}
+}
+
+func errorKiroResponse(status int, body string, headers map[string]string) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		for k, v := range headers {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}
+}
+
+func successRefresh(body map[string]interface{}) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(body)
+	}
+}
+
+// TestKiroExecute_Status401_RefreshAndRetry_Succeeds verifies that a 401 from
+// Kiro triggers exactly one bounded force refresh and one retry; if the retry
+// returns 200, Execute returns success and surfaces the new accessToken on the
+// auth metadata in-place.
+func TestKiroExecute_Status401_RefreshAndRetry_Succeeds(t *testing.T) {
+	script := &kiroScript{
+		t: t,
+		mainResponses: []func(http.ResponseWriter, *http.Request){
+			errorKiroResponse(http.StatusUnauthorized, `{"error":"expired token"}`, nil),
+			func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("Authorization"); got != "Bearer at-new" {
+					t.Fatalf("retry Authorization = %q, want Bearer at-new", got)
+				}
+				w.Header().Set("Content-Type", "application/octet-stream")
+				_, _ = w.Write([]byte(`binary{"content":"after-refresh"}`))
+			},
+		},
+		refreshResponses: []func(http.ResponseWriter, *http.Request){
+			successRefresh(map[string]interface{}{
+				"accessToken":  "at-new",
+				"refreshToken": "rt-rotated",
+				"expiresIn":    3600,
+			}),
+		},
+	}
+	server := httptest.NewServer(script.handler())
+	defer server.Close()
+	defer patchKiroEndpoints(t, server)()
+
+	auth := newKiroAuth("kiro-401-success", "at-old")
+	executor := NewKiroExecutor(nil)
+	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute err = %v, want nil", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "content.0.text").String(); got != "after-refresh" {
+		t.Fatalf("response content = %q, want after-refresh; payload=%s", got, string(resp.Payload))
+	}
+	if atomic.LoadInt32(&script.mainCalls) != 2 {
+		t.Fatalf("main calls = %d, want 2 (initial + 1 retry)", script.mainCalls)
+	}
+	if atomic.LoadInt32(&script.refreshCalls) != 1 {
+		t.Fatalf("refresh calls = %d, want exactly 1 force refresh", script.refreshCalls)
+	}
+	if got := kiroMetaStr(auth, "accessToken"); got != "at-new" {
+		t.Fatalf("auth accessToken = %q, want at-new", got)
+	}
+}
+
+// TestKiroExecute_Status401_RefreshAndRetry_FailsAfterRetry verifies the bound:
+// when the retry also returns 401, Execute propagates a classified KiroError
+// with status 401 and class "unauthorized", and only one refresh was attempted.
+func TestKiroExecute_Status401_RefreshAndRetry_FailsAfterRetry(t *testing.T) {
+	script := &kiroScript{
+		t: t,
+		mainResponses: []func(http.ResponseWriter, *http.Request){
+			errorKiroResponse(http.StatusUnauthorized, `{"error":"expired"}`, nil),
+			errorKiroResponse(http.StatusUnauthorized, `{"error":"still expired"}`, nil),
+		},
+		refreshResponses: []func(http.ResponseWriter, *http.Request){
+			successRefresh(map[string]interface{}{
+				"accessToken":  "at-new",
+				"refreshToken": "rt-rotated",
+				"expiresIn":    3600,
+			}),
+		},
+	}
+	server := httptest.NewServer(script.handler())
+	defer server.Close()
+	defer patchKiroEndpoints(t, server)()
+
+	auth := newKiroAuth("kiro-401-fail", "at-old")
+	executor := NewKiroExecutor(nil)
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err == nil {
+		t.Fatalf("Execute err = nil, want classified 401 error")
+	}
+	var ke *helps.KiroError
+	if !errors.As(err, &ke) {
+		t.Fatalf("expected *helps.KiroError, got %T: %v", err, err)
+	}
+	if ke.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("StatusCode = %d, want 401", ke.StatusCode())
+	}
+	if ke.Classification() != helps.KiroErrUnauthorized {
+		t.Fatalf("Classification = %q, want %q", ke.Classification(), helps.KiroErrUnauthorized)
+	}
+	if atomic.LoadInt32(&script.mainCalls) != 2 {
+		t.Fatalf("main calls = %d, want exactly 2 (no extra retries beyond the bounded one)", script.mainCalls)
+	}
+	if atomic.LoadInt32(&script.refreshCalls) != 1 {
+		t.Fatalf("refresh calls = %d, want exactly 1 bounded force refresh", script.refreshCalls)
+	}
+}
+
+// TestKiroExecute_Status401_RefreshFails_NoRetry verifies that if the bounded
+// refresh itself fails, Execute does NOT issue a second main call and instead
+// surfaces the original classified 401.
+func TestKiroExecute_Status401_RefreshFails_NoRetry(t *testing.T) {
+	script := &kiroScript{
+		t: t,
+		mainResponses: []func(http.ResponseWriter, *http.Request){
+			errorKiroResponse(http.StatusUnauthorized, `{"error":"expired"}`, nil),
+		},
+		refreshResponses: []func(http.ResponseWriter, *http.Request){
+			errorKiroResponse(http.StatusBadRequest, `{"error":"invalid_grant"}`, nil),
+		},
+	}
+	server := httptest.NewServer(script.handler())
+	defer server.Close()
+	defer patchKiroEndpoints(t, server)()
+
+	auth := newKiroAuth("kiro-401-refresh-fail", "at-old")
+	executor := NewKiroExecutor(nil)
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err == nil {
+		t.Fatal("Execute err = nil, want classified 401 error after refresh failure")
+	}
+	var ke *helps.KiroError
+	if !errors.As(err, &ke) {
+		t.Fatalf("expected *helps.KiroError, got %T: %v", err, err)
+	}
+	if ke.Classification() != helps.KiroErrUnauthorized {
+		t.Fatalf("Classification = %q, want unauthorized", ke.Classification())
+	}
+	if atomic.LoadInt32(&script.mainCalls) != 1 {
+		t.Fatalf("main calls = %d, want exactly 1 (no retry after refresh failure)", script.mainCalls)
+	}
+	if atomic.LoadInt32(&script.refreshCalls) != 1 {
+		t.Fatalf("refresh calls = %d, want exactly 1", script.refreshCalls)
+	}
+}
+
+// TestKiroExecute_StatusErrors_NoRefreshNoRetry covers 402, 403, 429, and 5xx:
+// each must return a classified KiroError without invoking refresh and without
+// retrying the upstream call.
+func TestKiroExecute_StatusErrors_NoRefreshNoRetry(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    int
+		body      string
+		headers   map[string]string
+		wantClass helps.KiroErrorClass
+		wantRetry bool // expect non-zero RetryAfter
+	}{
+		{
+			name:      "402 quota exhausted",
+			status:    402,
+			body:      `{"error":"monthly limit"}`,
+			wantClass: helps.KiroErrQuotaExhausted,
+		},
+		{
+			name:      "403 forbidden policy",
+			status:    403,
+			body:      `{"error":"profile policy denied"}`,
+			wantClass: helps.KiroErrForbidden,
+		},
+		{
+			name:      "429 rate limited with Retry-After",
+			status:    429,
+			body:      `{"error":"too many requests"}`,
+			headers:   map[string]string{"Retry-After": "5"},
+			wantClass: helps.KiroErrRateLimited,
+			wantRetry: true,
+		},
+		{
+			name:      "500 internal server error",
+			status:    500,
+			body:      `internal error`,
+			wantClass: helps.KiroErrServer,
+		},
+		{
+			name:      "503 service unavailable",
+			status:    503,
+			body:      `service unavailable`,
+			wantClass: helps.KiroErrServer,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			script := &kiroScript{
+				t: t,
+				mainResponses: []func(http.ResponseWriter, *http.Request){
+					errorKiroResponse(tt.status, tt.body, tt.headers),
+				},
+			}
+			server := httptest.NewServer(script.handler())
+			defer server.Close()
+			defer patchKiroEndpoints(t, server)()
+
+			auth := newKiroAuth("kiro-"+string(tt.wantClass), "at-test")
+			executor := NewKiroExecutor(nil)
+			_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "claude-sonnet-4-5",
+				Payload: []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`),
+			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+			if err == nil {
+				t.Fatalf("Execute err = nil, want classified error for status %d", tt.status)
+			}
+			var ke *helps.KiroError
+			if !errors.As(err, &ke) {
+				t.Fatalf("expected *helps.KiroError, got %T: %v", err, err)
+			}
+			if ke.StatusCode() != tt.status {
+				t.Fatalf("StatusCode = %d, want %d", ke.StatusCode(), tt.status)
+			}
+			if ke.Classification() != tt.wantClass {
+				t.Fatalf("Classification = %q, want %q", ke.Classification(), tt.wantClass)
+			}
+			if tt.wantRetry {
+				if ra := ke.RetryAfter(); ra == nil || *ra <= 0 {
+					t.Fatalf("RetryAfter = %v, want positive duration", ra)
+				}
+			}
+			if atomic.LoadInt32(&script.mainCalls) != 1 {
+				t.Fatalf("main calls = %d, want exactly 1 (no retry)", script.mainCalls)
+			}
+			if atomic.LoadInt32(&script.refreshCalls) != 0 {
+				t.Fatalf("refresh calls = %d, want exactly 0 (no refresh)", script.refreshCalls)
+			}
+		})
+	}
+}
+
+// TestKiroExecute_NetworkError_Classified verifies that a transport-level
+// failure (e.g. server hijacks then closes the connection without a status)
+// is wrapped as a network-classified KiroError without invoking refresh.
+func TestKiroExecute_NetworkError_Classified(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("ResponseWriter does not support Hijack")
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Fatalf("Hijack error: %v", err)
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+	origBase := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL + "/generateAssistantResponse"
+	defer func() { helps.KiroBaseURLTemplate = origBase }()
+
+	auth := newKiroAuth("kiro-net", "at-test")
+	executor := NewKiroExecutor(nil)
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err == nil {
+		t.Fatal("Execute err = nil, want network-classified error")
+	}
+	var ke *helps.KiroError
+	if !errors.As(err, &ke) {
+		t.Fatalf("expected *helps.KiroError, got %T: %v", err, err)
+	}
+	if ke.Classification() != helps.KiroErrNetwork {
+		t.Fatalf("Classification = %q, want %q", ke.Classification(), helps.KiroErrNetwork)
+	}
+	if ke.StatusCode() != 0 {
+		t.Fatalf("StatusCode = %d, want 0 for network error", ke.StatusCode())
+	}
+}
+
+// TestKiroExecuteStream_Status401_RefreshAndRetry verifies the streaming path
+// also benefits from the bounded force-refresh-once retry.
+func TestKiroExecuteStream_Status401_RefreshAndRetry(t *testing.T) {
+	script := &kiroScript{
+		t: t,
+		mainResponses: []func(http.ResponseWriter, *http.Request){
+			errorKiroResponse(http.StatusUnauthorized, `{"error":"expired"}`, nil),
+			func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("Authorization"); got != "Bearer at-stream-new" {
+					t.Fatalf("retry Authorization = %q, want Bearer at-stream-new", got)
+				}
+				w.Header().Set("Content-Type", "application/octet-stream")
+				_, _ = w.Write([]byte(`binary{"content":"stream-after-refresh"}`))
+			},
+		},
+		refreshResponses: []func(http.ResponseWriter, *http.Request){
+			successRefresh(map[string]interface{}{
+				"accessToken":  "at-stream-new",
+				"refreshToken": "rt-stream-rotated",
+				"expiresIn":    3600,
+			}),
+		},
+	}
+	server := httptest.NewServer(script.handler())
+	defer server.Close()
+	defer patchKiroEndpoints(t, server)()
+
+	auth := newKiroAuth("kiro-stream-401", "at-stream-old")
+	executor := NewKiroExecutor(nil)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("ExecuteStream err = %v, want nil after refresh retry", err)
+	}
+	var sawContent bool
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream chunk error: %v", chunk.Err)
+		}
+		if strings.Contains(string(chunk.Payload), "stream-after-refresh") {
+			sawContent = true
+		}
+	}
+	if !sawContent {
+		t.Fatal("expected stream content to include stream-after-refresh after refresh retry")
+	}
+	if atomic.LoadInt32(&script.mainCalls) != 2 {
+		t.Fatalf("main calls = %d, want 2 (initial + 1 retry)", script.mainCalls)
+	}
+	if atomic.LoadInt32(&script.refreshCalls) != 1 {
+		t.Fatalf("refresh calls = %d, want exactly 1", script.refreshCalls)
+	}
+}
+
+// TestKiroExecuteStream_Status402_QuotaExhausted_NoRetry verifies streaming 402
+// is classified and not retried.
+func TestKiroExecuteStream_Status402_QuotaExhausted_NoRetry(t *testing.T) {
+	script := &kiroScript{
+		t: t,
+		mainResponses: []func(http.ResponseWriter, *http.Request){
+			errorKiroResponse(http.StatusPaymentRequired, `{"error":"quota"}`, nil),
+		},
+	}
+	server := httptest.NewServer(script.handler())
+	defer server.Close()
+	defer patchKiroEndpoints(t, server)()
+
+	auth := newKiroAuth("kiro-stream-402", "at-test")
+	executor := NewKiroExecutor(nil)
+	_, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err == nil {
+		t.Fatal("ExecuteStream err = nil, want classified 402")
+	}
+	var ke *helps.KiroError
+	if !errors.As(err, &ke) {
+		t.Fatalf("expected *helps.KiroError, got %T: %v", err, err)
+	}
+	if ke.Classification() != helps.KiroErrQuotaExhausted {
+		t.Fatalf("Classification = %q, want quota_exhausted", ke.Classification())
+	}
+	if atomic.LoadInt32(&script.mainCalls) != 1 {
+		t.Fatalf("main calls = %d, want 1 (no retry)", script.mainCalls)
+	}
+	if atomic.LoadInt32(&script.refreshCalls) != 0 {
+		t.Fatalf("refresh calls = %d, want 0 (no refresh on 402)", script.refreshCalls)
 	}
 }

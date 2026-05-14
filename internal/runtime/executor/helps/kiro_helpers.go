@@ -1,13 +1,20 @@
 package helps
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -18,6 +25,7 @@ var (
 	KiroSocialRefreshURLTemplate = "https://prod.{{region}}.auth.desktop.kiro.dev/refreshToken"
 	KiroIDCRefreshURLTemplate    = "https://oidc.{{region}}.amazonaws.com/token"
 	KiroBaseURLTemplate          = "https://q.{{region}}.amazonaws.com/generateAssistantResponse"
+	KiroUsageLimitsURLTemplate   = "https://q.{{region}}.amazonaws.com/getUsageLimits"
 )
 
 const (
@@ -25,6 +33,7 @@ const (
 	KiroContentType          = "application/json"
 	KiroAcceptJSON           = "application/json"
 	KiroOriginAIEditor       = "AI_EDITOR"
+	KiroResourceAgentic      = "AGENTIC_REQUEST"
 	KiroChatTrigger          = "MANUAL"
 	KiroAgentTaskType        = "vibe"
 	KiroDefaultRegion        = "us-east-1"
@@ -54,6 +63,23 @@ var KiroModelMapping = map[string]string{
 	"claude-opus-4-5-20251101":   "claude-opus-4.5",
 	"claude-sonnet-4-5":          "claude-sonnet-4.5",
 	"claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
+}
+
+// KiroUsageLimitsURL builds the Kiro quota endpoint URL.
+func KiroUsageLimitsURL(region, profileArn string) string {
+	region = strings.TrimSpace(region)
+	if region == "" {
+		region = KiroDefaultRegion
+	}
+	base := strings.ReplaceAll(KiroUsageLimitsURLTemplate, "{{region}}", region)
+	values := url.Values{}
+	values.Set("origin", KiroOriginAIEditor)
+	values.Set("resourceType", KiroResourceAgentic)
+	values.Set("isEmailRequired", "true")
+	if profileArn = strings.TrimSpace(profileArn); profileArn != "" {
+		values.Set("profileArn", profileArn)
+	}
+	return base + "?" + values.Encode()
 }
 
 // MapKiroModel returns the upstream CodeWhisperer model ID for the given client model.
@@ -452,6 +478,219 @@ func normalizeThinkingBudget(budget int) int {
 		budget = KiroMaxBudgetTokens
 	}
 	return budget
+}
+
+// --- Kiro error classification ---
+//
+// These helpers mirror the minimum viable executor-local error policy described
+// in the Kiro core-reliability spec (P0-2). They classify upstream HTTP and
+// network errors into stable buckets that the conductor and telemetry layers
+// can reason about without leaking secrets. A full multi-credential health
+// model lives in `kiro.rs`; this is intentionally a smaller surface meant to
+// be reusable by a shared provider-policy layer in the future.
+
+// KiroErrorClass enumerates the runtime classifications for Kiro errors.
+type KiroErrorClass string
+
+const (
+	// KiroErrUnauthorized indicates a 401 from the Kiro endpoint. The bearer
+	// token is no longer accepted; the executor should attempt one bounded
+	// force refresh and one retry before propagating.
+	KiroErrUnauthorized KiroErrorClass = "unauthorized"
+	// KiroErrQuotaExhausted indicates a 402 (quota/billing) response. The
+	// credential is healthy but cannot serve more traffic in the current
+	// window; the conductor should fail over without poisoning credentials.
+	KiroErrQuotaExhausted KiroErrorClass = "quota_exhausted"
+	// KiroErrForbidden indicates a 403 response that is not a refreshable
+	// auth failure (e.g. policy / profile / region restriction).
+	KiroErrForbidden KiroErrorClass = "forbidden"
+	// KiroErrRateLimited indicates a 429 response. Treated as transient with
+	// optional Retry-After backoff; the credential is not poisoned.
+	KiroErrRateLimited KiroErrorClass = "rate_limited"
+	// KiroErrServer indicates a transient upstream 5xx (or 408) failure. The
+	// credential is not poisoned; the conductor may retry on another auth.
+	KiroErrServer KiroErrorClass = "server"
+	// KiroErrNetwork indicates a transport-level failure before a response
+	// was received (DNS / TCP / TLS / EOF). The credential is not poisoned.
+	KiroErrNetwork KiroErrorClass = "network"
+	// KiroErrUnknown is used when the status code does not match any known
+	// bucket and a network classification does not apply.
+	KiroErrUnknown KiroErrorClass = "unknown"
+)
+
+// KiroError is a classified Kiro error returned by Execute / ExecuteStream.
+// It implements the runtime executor's `StatusError` contract (`StatusCode()
+// int`) and exposes an optional `RetryAfter()` for 429 handling, so the
+// existing conductor failover and cooldown logic continues to work without
+// further changes.
+//
+// The body is preserved for surfacing user-facing details and never includes
+// secrets — callers must avoid logging or echoing it in contexts where token
+// material could be present.
+type KiroError struct {
+	Class      KiroErrorClass
+	Status     int
+	Body       string
+	retryAfter *time.Duration
+	cause      error
+}
+
+// Error implements the error interface. The format intentionally avoids
+// secrets and only surfaces classification, status, and the upstream body
+// (which originates from Kiro and can contain operator-relevant details).
+func (e *KiroError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Status > 0 {
+		if e.Body != "" {
+			return fmt.Sprintf("kiro: %s (status %d): %s", e.Class, e.Status, e.Body)
+		}
+		return fmt.Sprintf("kiro: %s (status %d)", e.Class, e.Status)
+	}
+	if e.cause != nil {
+		return fmt.Sprintf("kiro: %s: %s", e.Class, e.cause.Error())
+	}
+	if e.Body != "" {
+		return fmt.Sprintf("kiro: %s: %s", e.Class, e.Body)
+	}
+	return fmt.Sprintf("kiro: %s", e.Class)
+}
+
+// StatusCode satisfies the runtime executor `StatusError` interface so that
+// the conductor's existing 401/402/403/429/5xx state-machine continues to
+// work. A network error returns 0; the conductor treats that as a generic
+// failure and proceeds to the next credential.
+func (e *KiroError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.Status
+}
+
+// RetryAfter returns the upstream Retry-After hint for 429 responses, if
+// present and parseable. The conductor uses it to schedule cooldowns.
+func (e *KiroError) RetryAfter() *time.Duration {
+	if e == nil || e.retryAfter == nil {
+		return nil
+	}
+	d := *e.retryAfter
+	return &d
+}
+
+// Unwrap exposes the underlying transport error for `errors.Is`/`errors.As`.
+func (e *KiroError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// Classification returns the stable error bucket for telemetry and tests.
+func (e *KiroError) Classification() KiroErrorClass {
+	if e == nil {
+		return ""
+	}
+	return e.Class
+}
+
+// ClassifyKiroHTTPStatus classifies a non-2xx HTTP response from Kiro into
+// the canonical KiroError. The body is captured verbatim for diagnostics; it
+// must not contain credentials or refresh tokens (Kiro responses do not).
+//
+// The returned error is always non-nil for non-2xx statuses. For 2xx, callers
+// must not invoke this helper. Caller-supplied `header` may be nil; it is only
+// inspected to read `Retry-After` for 429.
+func ClassifyKiroHTTPStatus(status int, body []byte, header http.Header) *KiroError {
+	classified := &KiroError{
+		Status: status,
+		Body:   strings.TrimSpace(string(body)),
+	}
+	switch {
+	case status == http.StatusUnauthorized: // 401
+		classified.Class = KiroErrUnauthorized
+	case status == http.StatusPaymentRequired: // 402
+		classified.Class = KiroErrQuotaExhausted
+	case status == http.StatusForbidden: // 403
+		classified.Class = KiroErrForbidden
+	case status == http.StatusTooManyRequests: // 429
+		classified.Class = KiroErrRateLimited
+		if d := parseRetryAfterHeader(header); d != nil {
+			classified.retryAfter = d
+		}
+	case status == http.StatusRequestTimeout: // 408
+		classified.Class = KiroErrServer
+	case status >= 500 && status < 600:
+		classified.Class = KiroErrServer
+	default:
+		classified.Class = KiroErrUnknown
+	}
+	return classified
+}
+
+// ClassifyKiroNetworkError wraps a transport-level error from
+// `httpClient.Do(...)` (or comparable) into a KiroError with the network
+// classification, unless the error is `context.Canceled` /
+// `context.DeadlineExceeded`, in which case the original error is returned
+// unchanged so that callers and tests see the canonical context error.
+func ClassifyKiroNetworkError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return &KiroError{
+		Class: KiroErrNetwork,
+		cause: err,
+	}
+}
+
+// IsTransientNetworkError reports whether err is a network error that is
+// safe to retry on a different credential without disabling the current one.
+// It returns true for `KiroError{Class: KiroErrNetwork}` and for common
+// `net.Error`/`io.EOF`/`syscall` style transport failures.
+func IsTransientNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ke *KiroError
+	if errors.As(err, &ke) && ke != nil {
+		return ke.Class == KiroErrNetwork || ke.Class == KiroErrServer || ke.Class == KiroErrRateLimited
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne != nil {
+		return true
+	}
+	return false
+}
+
+// parseRetryAfterHeader parses the HTTP Retry-After header per RFC 9110
+// (delta-seconds or HTTP-date). Returns nil if absent, malformed, or in the
+// past.
+func parseRetryAfterHeader(header http.Header) *time.Duration {
+	if header == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(header.Get("Retry-After"))
+	if raw == "" {
+		return nil
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil {
+		if seconds <= 0 {
+			return nil
+		}
+		d := time.Duration(seconds) * time.Second
+		return &d
+	}
+	if t, err := http.ParseTime(raw); err == nil {
+		d := time.Until(t)
+		if d <= 0 {
+			return nil
+		}
+		return &d
+	}
+	return nil
 }
 
 // SanitizeToolInput removes empty-string keys from a tool input map.

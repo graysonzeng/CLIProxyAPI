@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -211,17 +212,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, fmt.Errorf("kiro executor: %w", err)
 	}
 
-	region := kiroMetaStr(auth, "region")
-	url := helps.KiroBaseURL(region)
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(cwReq))
-	if err != nil {
-		return resp, fmt.Errorf("kiro executor: %w", err)
-	}
-	applyKiroHTTPHeaders(httpReq, auth)
-
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := e.sendKiroRequest(ctx, auth, cwReq, baseModel)
 	if err != nil {
 		return resp, err
 	}
@@ -230,11 +221,6 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 			log.Errorf("kiro executor: response body close error: %v", errClose)
 		}
 	}()
-
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		return resp, statusErr{code: httpResp.StatusCode, msg: string(b)}
-	}
 
 	rawResp, err := io.ReadAll(httpResp.Body)
 	if err != nil {
@@ -282,27 +268,9 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, fmt.Errorf("kiro executor: %w", err)
 	}
 
-	region := kiroMetaStr(auth, "region")
-	url := helps.KiroBaseURL(region)
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(cwReq))
-	if err != nil {
-		return nil, fmt.Errorf("kiro executor: %w", err)
-	}
-	applyKiroHTTPHeaders(httpReq, auth)
-
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := e.sendKiroRequest(ctx, auth, cwReq, baseModel)
 	if err != nil {
 		return nil, err
-	}
-
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("kiro executor: response body close error: %v", errClose)
-		}
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(b)}
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -344,6 +312,174 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 }
 
 // --- Internal helpers ---
+
+// sendKiroRequest sends the prepared CodeWhisperer request to Kiro and returns
+// the open response on success. It implements the minimum viable executor-local
+// runtime error policy described in the Kiro core-reliability spec (P0-2):
+//
+//   - 401 invalid bearer: attempt one bounded force refresh and retry exactly
+//     once. If the second attempt is also 401 (or any other error), propagate
+//     the classified error so the conductor can fail over.
+//   - 402 quota exhausted, 403 forbidden, 429 rate-limited, 408/5xx transient,
+//     and network errors: classify into KiroError without retrying or
+//     poisoning credential state. The conductor's existing failover/cooldown
+//     logic handles cross-credential routing.
+//
+// On non-2xx, the response body is fully consumed and closed before the
+// classified error is returned. On success, the caller owns the open body.
+func (e *KiroExecutor) sendKiroRequest(ctx context.Context, auth *cliproxyauth.Auth, cwReq []byte, baseModel string) (*http.Response, error) {
+	region := kiroMetaStr(auth, "region")
+	url := helps.KiroBaseURL(region)
+
+	requestID := logging.GetRequestID(ctx)
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
+
+	// First attempt.
+	resp, err := e.doKiroHTTP(ctx, auth, url, cwReq)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"event":       "request_error",
+			"provider":    e.Identifier(),
+			"auth_id":     authID,
+			"model":       baseModel,
+			"error_class": helps.KiroErrNetwork,
+			"request_id":  requestID,
+		}).Warnf("kiro executor: network error: %v", err)
+		return nil, err
+	}
+
+	// Success path: hand the open body to the caller.
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		log.WithFields(log.Fields{
+			"event":           "request_complete",
+			"provider":        e.Identifier(),
+			"auth_id":         authID,
+			"model":           baseModel,
+			"upstream_status": resp.StatusCode,
+			"request_id":      requestID,
+		}).Debug("kiro executor: request complete")
+		return resp, nil
+	}
+
+	// Non-2xx on first attempt. Classify, then decide whether to retry once.
+	classified := classifyAndCloseKiroResponse(resp)
+
+	if classified.Class == helps.KiroErrUnauthorized {
+		log.WithFields(log.Fields{
+			"event":           "refresh_attempt",
+			"provider":        e.Identifier(),
+			"auth_id":         authID,
+			"model":           baseModel,
+			"upstream_status": classified.Status,
+			"request_id":      requestID,
+		}).Warn("kiro executor: 401 from upstream; attempting bounded force refresh + single retry")
+
+		_, refreshErr := e.Refresh(ctx, auth)
+		if refreshErr != nil {
+			log.WithFields(log.Fields{
+				"event":      "refresh_result",
+				"provider":   e.Identifier(),
+				"auth_id":    authID,
+				"model":      baseModel,
+				"outcome":    "failed",
+				"request_id": requestID,
+			}).Warnf("kiro executor: refresh failed: %v", refreshErr)
+			return nil, classified
+		}
+		log.WithFields(log.Fields{
+			"event":      "refresh_result",
+			"provider":   e.Identifier(),
+			"auth_id":    authID,
+			"model":      baseModel,
+			"outcome":    "succeeded",
+			"request_id": requestID,
+		}).Info("kiro executor: refresh succeeded; retrying request once")
+
+		retryResp, retryErr := e.doKiroHTTP(ctx, auth, url, cwReq)
+		if retryErr != nil {
+			log.WithFields(log.Fields{
+				"event":       "request_error",
+				"provider":    e.Identifier(),
+				"auth_id":     authID,
+				"model":       baseModel,
+				"error_class": helps.KiroErrNetwork,
+				"request_id":  requestID,
+				"retry":       true,
+			}).Warnf("kiro executor: network error after refresh retry: %v", retryErr)
+			return nil, retryErr
+		}
+		if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
+			log.WithFields(log.Fields{
+				"event":           "request_complete",
+				"provider":        e.Identifier(),
+				"auth_id":         authID,
+				"model":           baseModel,
+				"upstream_status": retryResp.StatusCode,
+				"request_id":      requestID,
+				"retry":           true,
+			}).Debug("kiro executor: request complete after refresh retry")
+			return retryResp, nil
+		}
+		retryClassified := classifyAndCloseKiroResponse(retryResp)
+		log.WithFields(log.Fields{
+			"event":           "request_error",
+			"provider":        e.Identifier(),
+			"auth_id":         authID,
+			"model":           baseModel,
+			"upstream_status": retryClassified.Status,
+			"error_class":     retryClassified.Class,
+			"request_id":      requestID,
+			"retry":           true,
+		}).Warn("kiro executor: classified error after refresh retry")
+		return nil, retryClassified
+	}
+
+	log.WithFields(log.Fields{
+		"event":           "request_error",
+		"provider":        e.Identifier(),
+		"auth_id":         authID,
+		"model":           baseModel,
+		"upstream_status": classified.Status,
+		"error_class":     classified.Class,
+		"request_id":      requestID,
+	}).Warn("kiro executor: classified upstream error")
+	return nil, classified
+}
+
+// doKiroHTTP issues a single HTTP request to Kiro using a fresh body reader and
+// the latest credentials (after a possible Refresh). Network failures are
+// wrapped via helps.ClassifyKiroNetworkError.
+func (e *KiroExecutor) doKiroHTTP(ctx context.Context, auth *cliproxyauth.Auth, url string, cwReq []byte) (*http.Response, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(cwReq))
+	if err != nil {
+		return nil, fmt.Errorf("kiro executor: %w", err)
+	}
+	applyKiroHTTPHeaders(httpReq, auth)
+
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, helps.ClassifyKiroNetworkError(err)
+	}
+	return resp, nil
+}
+
+// classifyAndCloseKiroResponse reads the upstream body, closes it, and returns
+// a classified KiroError. Used for non-2xx responses where the executor will
+// not stream the body to the caller.
+func classifyAndCloseKiroResponse(resp *http.Response) *helps.KiroError {
+	if resp == nil {
+		return nil
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if errClose := resp.Body.Close(); errClose != nil {
+		log.Errorf("kiro executor: response body close error: %v", errClose)
+	}
+	return helps.ClassifyKiroHTTPStatus(resp.StatusCode, body, resp.Header)
+}
 
 func kiroAccessToken(auth *cliproxyauth.Auth) string {
 	return kiroMetaStr(auth, "accessToken")

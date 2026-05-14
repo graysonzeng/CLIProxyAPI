@@ -1,9 +1,15 @@
 package helps
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestShortenKiroToolName_Short(t *testing.T) {
@@ -108,6 +114,68 @@ func TestMapKiroModel(t *testing.T) {
 		if result != tt.expected {
 			t.Errorf("MapKiroModel(%q) = %q, want %q", tt.input, result, tt.expected)
 		}
+	}
+}
+
+func TestKiroUsageLimitsURL(t *testing.T) {
+	tests := []struct {
+		name              string
+		region            string
+		profileArn        string
+		wantHost          string
+		wantProfileArn    string
+		wantProfileArnSet bool
+	}{
+		{
+			name:              "profile arn",
+			region:            "us-west-2",
+			profileArn:        "arn:aws:kiro:profile",
+			wantHost:          "q.us-west-2.amazonaws.com",
+			wantProfileArn:    "arn:aws:kiro:profile",
+			wantProfileArnSet: true,
+		},
+		{
+			name:              "empty region and profile arn",
+			region:            "",
+			profileArn:        "",
+			wantHost:          "q.us-east-1.amazonaws.com",
+			wantProfileArnSet: false,
+		},
+		{
+			name:              "empty profile arn",
+			region:            "us-west-2",
+			profileArn:        "",
+			wantHost:          "q.us-west-2.amazonaws.com",
+			wantProfileArnSet: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := KiroUsageLimitsURL(tt.region, tt.profileArn)
+			parsed, err := url.Parse(got)
+			if err != nil {
+				t.Fatalf("url.Parse returned error: %v", err)
+			}
+			if parsed.Scheme != "https" || parsed.Host != tt.wantHost || parsed.Path != "/getUsageLimits" {
+				t.Fatalf("unexpected URL = %s", got)
+			}
+			query := parsed.Query()
+			if query.Get("origin") != KiroOriginAIEditor {
+				t.Fatalf("origin = %q, want %q", query.Get("origin"), KiroOriginAIEditor)
+			}
+			if query.Get("resourceType") != KiroResourceAgentic {
+				t.Fatalf("resourceType = %q, want %q", query.Get("resourceType"), KiroResourceAgentic)
+			}
+			if query.Get("isEmailRequired") != "true" {
+				t.Fatalf("isEmailRequired = %q, want true", query.Get("isEmailRequired"))
+			}
+			if gotProfileArn, ok := query["profileArn"]; ok != tt.wantProfileArnSet {
+				t.Fatalf("profileArn present = %v, want %v; values = %v", ok, tt.wantProfileArnSet, gotProfileArn)
+			}
+			if tt.wantProfileArnSet && query.Get("profileArn") != tt.wantProfileArn {
+				t.Fatalf("profileArn = %q, want %q", query.Get("profileArn"), tt.wantProfileArn)
+			}
+		})
 	}
 }
 
@@ -326,5 +394,170 @@ func TestSanitizeToolInput_NoChange(t *testing.T) {
 	result := SanitizeToolInput(input)
 	if string(result) != string(input) {
 		t.Errorf("unchanged input should be returned as-is")
+	}
+}
+
+// --- Kiro error classification tests ---
+
+func TestClassifyKiroHTTPStatus_KnownBuckets(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    int
+		body      string
+		header    http.Header
+		wantClass KiroErrorClass
+	}{
+		{name: "401 unauthorized", status: 401, body: "expired token", wantClass: KiroErrUnauthorized},
+		{name: "402 quota exhausted", status: 402, body: "monthly limit reached", wantClass: KiroErrQuotaExhausted},
+		{name: "403 forbidden policy", status: 403, body: "profile policy denied", wantClass: KiroErrForbidden},
+		{name: "408 request timeout treated as transient server", status: 408, wantClass: KiroErrServer},
+		{name: "429 rate limited", status: 429, body: "too many requests", wantClass: KiroErrRateLimited},
+		{name: "500 internal server", status: 500, wantClass: KiroErrServer},
+		{name: "502 bad gateway", status: 502, wantClass: KiroErrServer},
+		{name: "503 service unavailable", status: 503, wantClass: KiroErrServer},
+		{name: "504 gateway timeout", status: 504, wantClass: KiroErrServer},
+		{name: "420 unknown 4xx", status: 420, wantClass: KiroErrUnknown},
+		{name: "418 teapot unknown", status: 418, wantClass: KiroErrUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ke := ClassifyKiroHTTPStatus(tt.status, []byte(tt.body), tt.header)
+			if ke == nil {
+				t.Fatalf("ClassifyKiroHTTPStatus returned nil")
+			}
+			if ke.Classification() != tt.wantClass {
+				t.Fatalf("Classification = %q, want %q", ke.Classification(), tt.wantClass)
+			}
+			if ke.StatusCode() != tt.status {
+				t.Fatalf("StatusCode = %d, want %d", ke.StatusCode(), tt.status)
+			}
+			// Error string must include classification and status code, but
+			// must not leak headers (no token material is supplied to this
+			// helper, but the format must remain stable).
+			msg := ke.Error()
+			if msg == "" {
+				t.Fatalf("Error() returned empty string")
+			}
+			if !strings.Contains(msg, string(tt.wantClass)) {
+				t.Fatalf("Error() = %q, expected to contain class %q", msg, tt.wantClass)
+			}
+		})
+	}
+}
+
+func TestClassifyKiroHTTPStatus_RetryAfterSeconds(t *testing.T) {
+	header := http.Header{}
+	header.Set("Retry-After", "12")
+	ke := ClassifyKiroHTTPStatus(429, []byte("rate limited"), header)
+	if ke.Classification() != KiroErrRateLimited {
+		t.Fatalf("Classification = %q, want %q", ke.Classification(), KiroErrRateLimited)
+	}
+	got := ke.RetryAfter()
+	if got == nil {
+		t.Fatalf("RetryAfter = nil, want 12s")
+	}
+	if *got != 12*time.Second {
+		t.Fatalf("RetryAfter = %v, want 12s", *got)
+	}
+}
+
+func TestClassifyKiroHTTPStatus_RetryAfterDate(t *testing.T) {
+	header := http.Header{}
+	future := time.Now().UTC().Add(45 * time.Second).Format(http.TimeFormat)
+	header.Set("Retry-After", future)
+	ke := ClassifyKiroHTTPStatus(429, nil, header)
+	got := ke.RetryAfter()
+	if got == nil {
+		t.Fatalf("RetryAfter = nil, want positive duration")
+	}
+	if *got <= 0 {
+		t.Fatalf("RetryAfter = %v, want >0", *got)
+	}
+}
+
+func TestClassifyKiroHTTPStatus_RetryAfterPastDateIgnored(t *testing.T) {
+	header := http.Header{}
+	header.Set("Retry-After", time.Now().UTC().Add(-1*time.Hour).Format(http.TimeFormat))
+	ke := ClassifyKiroHTTPStatus(429, nil, header)
+	if ke.RetryAfter() != nil {
+		t.Fatalf("RetryAfter for past date should be ignored")
+	}
+}
+
+func TestClassifyKiroHTTPStatus_NonRateLimitedIgnoresRetryAfter(t *testing.T) {
+	header := http.Header{}
+	header.Set("Retry-After", "30")
+	ke := ClassifyKiroHTTPStatus(503, nil, header)
+	if ke.Classification() != KiroErrServer {
+		t.Fatalf("Classification = %q, want %q", ke.Classification(), KiroErrServer)
+	}
+	// 5xx classifier intentionally does not surface Retry-After today;
+	// document the boundary so future change is intentional.
+	if ke.RetryAfter() != nil {
+		t.Fatalf("non-429 should not expose Retry-After in current contract; got %v", *ke.RetryAfter())
+	}
+}
+
+func TestClassifyKiroNetworkError_WrapsTransport(t *testing.T) {
+	src := errors.New("dial tcp: i/o timeout")
+	classified := ClassifyKiroNetworkError(src)
+	var ke *KiroError
+	if !errors.As(classified, &ke) {
+		t.Fatalf("expected *KiroError, got %T: %v", classified, classified)
+	}
+	if ke.Classification() != KiroErrNetwork {
+		t.Fatalf("Classification = %q, want %q", ke.Classification(), KiroErrNetwork)
+	}
+	if ke.StatusCode() != 0 {
+		t.Fatalf("StatusCode = %d, want 0 for network error", ke.StatusCode())
+	}
+	if !errors.Is(classified, src) {
+		t.Fatalf("expected wrapped error to satisfy errors.Is(src)")
+	}
+}
+
+func TestClassifyKiroNetworkError_PreservesContextErrors(t *testing.T) {
+	if got := ClassifyKiroNetworkError(context.Canceled); !errors.Is(got, context.Canceled) {
+		t.Fatalf("context.Canceled should be returned unchanged, got %v", got)
+	}
+	if got := ClassifyKiroNetworkError(context.DeadlineExceeded); !errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("context.DeadlineExceeded should be returned unchanged, got %v", got)
+	}
+}
+
+func TestKiroError_NilSafety(t *testing.T) {
+	var ke *KiroError
+	if got := ke.Error(); got != "" {
+		t.Fatalf("nil KiroError Error() = %q, want empty", got)
+	}
+	if got := ke.StatusCode(); got != 0 {
+		t.Fatalf("nil KiroError StatusCode() = %d, want 0", got)
+	}
+	if ke.RetryAfter() != nil {
+		t.Fatalf("nil KiroError RetryAfter() should be nil")
+	}
+	if got := ke.Classification(); got != "" {
+		t.Fatalf("nil KiroError Classification() = %q, want empty", got)
+	}
+	if ke.Unwrap() != nil {
+		t.Fatalf("nil KiroError Unwrap() should be nil")
+	}
+}
+
+func TestKiroError_DoesNotLeakSecrets(t *testing.T) {
+	// The body is preserved verbatim; verify that the error format itself
+	// does not echo arbitrary header material the caller never supplied.
+	ke := ClassifyKiroHTTPStatus(401, []byte(`{"error":"invalid bearer"}`), http.Header{})
+	msg := ke.Error()
+	if strings.Contains(msg, "Bearer") {
+		t.Fatalf("Error() must not surface the literal Authorization header value: %q", msg)
+	}
+	// Provide a body that contains a fake token-shaped string and verify it
+	// is NOT silently scrubbed (we explicitly preserve upstream body), but
+	// that the helper does not append any other secret-like fields.
+	bodyWithMarker := fmt.Sprintf("upstream-body-%d", time.Now().UnixNano())
+	ke2 := ClassifyKiroHTTPStatus(403, []byte(bodyWithMarker), nil)
+	if !strings.Contains(ke2.Error(), bodyWithMarker) {
+		t.Fatalf("upstream body should be preserved in Error(): %q", ke2.Error())
 	}
 }

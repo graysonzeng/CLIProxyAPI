@@ -20,6 +20,11 @@ const DisallowFreeAuthMetadataKey = "disallow_free_auth"
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
+	// SyntheticRequestMetadataKey marks internally generated traffic that must not
+	// affect auth health or real-traffic request counters.
+	SyntheticRequestMetadataKey = "synthetic_request"
+	// SyntheticRequestKindWarmup identifies provider warmup traffic.
+	SyntheticRequestKindWarmup = "warmup"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.
 	SelectedAuthMetadataKey = "selected_auth_id"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.

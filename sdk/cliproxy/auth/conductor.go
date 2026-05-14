@@ -102,6 +102,9 @@ type Result struct {
 	Model string
 	// Success marks whether the execution succeeded.
 	Success bool
+	// Synthetic marks internally generated traffic that must not affect auth
+	// availability or real-traffic request counters.
+	Synthetic bool
 	// RetryAfter carries a provider supplied retry hint (e.g. 429 retryDelay).
 	RetryAfter *time.Duration
 	// Error describes the failure when Success is false.
@@ -806,7 +809,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, synthetic bool) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -819,7 +822,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Synthetic: synthetic, Error: rerr})
 			}
 			if !forward {
 				return false
@@ -849,7 +852,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
+			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true, Synthetic: synthetic})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
@@ -874,7 +877,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Synthetic: isSyntheticRequestMetadata(opts.Metadata), Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
 			if isRequestInvalidError(errStream) {
@@ -895,7 +898,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Synthetic: isSyntheticRequestMetadata(opts.Metadata), Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
@@ -906,7 +909,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Synthetic: isSyntheticRequestMetadata(opts.Metadata), Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
@@ -917,7 +920,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Synthetic: isSyntheticRequestMetadata(opts.Metadata), Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			m.MarkResult(ctx, result)
 			discardStreamChunks(streamResult.Chunks)
@@ -926,7 +929,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Synthetic: isSyntheticRequestMetadata(opts.Metadata), Error: emptyErr}
 			m.MarkResult(ctx, result)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
@@ -941,7 +944,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, isSyntheticRequestMetadata(opts.Metadata)), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -1371,7 +1374,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Synthetic: isSyntheticRequestMetadata(opts.Metadata)}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -1459,7 +1462,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Synthetic: isSyntheticRequestMetadata(opts.Metadata)}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -1676,6 +1679,28 @@ func pinnedAuthIDFromMetadata(meta map[string]any) string {
 	default:
 		return ""
 	}
+}
+
+func syntheticRequestKindFromMetadata(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	raw, ok := meta[cliproxyexecutor.SyntheticRequestMetadataKey]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch val := raw.(type) {
+	case string:
+		return strings.TrimSpace(val)
+	case []byte:
+		return strings.TrimSpace(string(val))
+	default:
+		return ""
+	}
+}
+
+func isSyntheticRequestMetadata(meta map[string]any) bool {
+	return syntheticRequestKindFromMetadata(meta) != ""
 }
 
 func disallowFreeAuthFromMetadata(meta map[string]any) bool {
@@ -2150,6 +2175,18 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
+		if result.Synthetic {
+			m.mu.Unlock()
+			log.WithFields(log.Fields{
+				"provider": result.Provider,
+				"auth_id":  result.AuthID,
+				"model":    result.Model,
+				"success":  result.Success,
+			}).Debug("synthetic result skipped auth state")
+			m.hook.OnResult(ctx, result)
+			return
+		}
+
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {
 			auth.Success++
@@ -3581,7 +3618,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
-			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil, Synthetic: isSyntheticRequestMetadata(opts.Metadata)}
 			if errExec != nil {
 				result.Error = &Error{Message: errExec.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
@@ -3937,7 +3974,51 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	return true
 }
 
+// RefreshAuthByID refreshes one auth through the registered provider executor
+// when the normal refresh evaluator says it is due. It returns the latest auth
+// snapshot, whether a refresh was attempted, and any refresh error.
+func (m *Manager) RefreshAuthByID(ctx context.Context, id string) (*Auth, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, false, &Error{Code: "auth_not_found", Message: "auth id is required", HTTPStatus: http.StatusNotFound}
+	}
+	now := time.Now()
+	m.mu.RLock()
+	auth := m.auths[id]
+	var cloned *Auth
+	var exec ProviderExecutor
+	if auth != nil {
+		cloned = auth.Clone()
+		exec = m.executors[auth.Provider]
+	}
+	m.mu.RUnlock()
+	if cloned == nil {
+		return nil, false, &Error{Code: "auth_not_found", Message: "auth not found", HTTPStatus: http.StatusNotFound}
+	}
+	if exec == nil {
+		return cloned, false, &Error{Code: "executor_not_found", Message: "executor not registered", HTTPStatus: http.StatusConflict}
+	}
+	if !m.shouldRefresh(cloned, now) {
+		return cloned, false, nil
+	}
+	if !m.markRefreshPending(id, now) {
+		latest, _ := m.GetByID(id)
+		if latest == nil {
+			latest = cloned
+		}
+		return latest, false, nil
+	}
+	return m.refreshAuthInternal(ctx, id)
+}
+
 func (m *Manager) refreshAuth(ctx context.Context, id string) {
+	_, _, _ = m.refreshAuthInternal(ctx, id)
+}
+
+func (m *Manager) refreshAuthInternal(ctx context.Context, id string) (*Auth, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -3951,18 +4032,22 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	}
 	m.mu.RUnlock()
 	if auth == nil || exec == nil {
-		return
+		if auth == nil {
+			return nil, false, &Error{Code: "auth_not_found", Message: "auth not found", HTTPStatus: http.StatusNotFound}
+		}
+		return cloned, false, &Error{Code: "executor_not_found", Message: "executor not registered", HTTPStatus: http.StatusConflict}
 	}
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
-		return
+		return cloned, true, err
 	}
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
 		unauthorized := isUnauthorizedError(err)
 		shouldReschedule := false
+		var snapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.LastError = refreshErrorFromError(err)
@@ -3975,6 +4060,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			}
 			m.auths[id] = current
+			snapshot = current.Clone()
 			shouldReschedule = true
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
@@ -3984,7 +4070,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)
 		}
-		return
+		return snapshot, true, err
 	}
 	if updated == nil {
 		updated = cloned
@@ -4001,7 +4087,11 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
-	_, _ = m.Update(ctx, updated)
+	stored, errUpdate := m.Update(ctx, updated)
+	if errUpdate != nil {
+		return stored, true, errUpdate
+	}
+	return stored, true, nil
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
