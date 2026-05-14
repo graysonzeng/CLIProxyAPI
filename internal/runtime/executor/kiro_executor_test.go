@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -1515,5 +1517,275 @@ func TestKiroExecuteStream_Status402_QuotaExhausted_NoRetry(t *testing.T) {
 	}
 	if atomic.LoadInt32(&script.refreshCalls) != 0 {
 		t.Fatalf("refresh calls = %d, want 0 (no refresh on 402)", script.refreshCalls)
+	}
+}
+
+// --- HIGH-2 (P0-2 follow-up) manager persistence regression ---
+//
+// recordingKiroStore is a minimal in-memory cliproxyauth.Store used to verify
+// that Manager.Update writes refreshed Kiro auth back to persistent storage
+// after a bounded 401 -> refresh -> retry succeeds. It records every Save call
+// so the test can assert exactly which credential snapshot was persisted.
+type recordingKiroStore struct {
+	mu    sync.Mutex
+	saved []*cliproxyauth.Auth
+	items map[string]*cliproxyauth.Auth
+}
+
+func newRecordingKiroStore() *recordingKiroStore {
+	return &recordingKiroStore{items: make(map[string]*cliproxyauth.Auth)}
+}
+
+func (s *recordingKiroStore) List(_ context.Context) ([]*cliproxyauth.Auth, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*cliproxyauth.Auth, 0, len(s.items))
+	for _, a := range s.items {
+		out = append(out, a.Clone())
+	}
+	return out, nil
+}
+
+func (s *recordingKiroStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string, error) {
+	if auth == nil {
+		return "", nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	clone := auth.Clone()
+	s.items[auth.ID] = clone
+	s.saved = append(s.saved, clone)
+	return auth.ID, nil
+}
+
+func (s *recordingKiroStore) Delete(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.items, id)
+	return nil
+}
+
+func (s *recordingKiroStore) latestAccessToken(authID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.saved) - 1; i >= 0; i-- {
+		if s.saved[i].ID == authID {
+			if v, ok := s.saved[i].Metadata["accessToken"].(string); ok {
+				return v
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+func (s *recordingKiroStore) saveCallsForAccessToken(authID, token string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := 0
+	for _, snap := range s.saved {
+		if snap.ID != authID {
+			continue
+		}
+		if v, _ := snap.Metadata["accessToken"].(string); v == token {
+			count++
+		}
+	}
+	return count
+}
+
+// TestKiroManagerExecute_401RefreshPersistsToManagerAndStore is the regression
+// test for HIGH-2 from the 2026-05-14 Kiro reliability code review. It runs a
+// full Manager.Execute loop end-to-end against a scripted Kiro upstream (401
+// then refresh then 200) and asserts that:
+//
+//  1. Execute succeeds after the bounded refresh-and-retry.
+//  2. Manager.GetByID(authID) reflects the new accessToken (i.e. the in-memory
+//     map was rewritten via Manager.Update, not just the local executor clone).
+//  3. The configured Store received a Save call carrying the new accessToken,
+//     so subsequent process restarts also start with the rotated credential.
+//
+// Without the HIGH-2 fix, only the executor's request-local auth clone would
+// observe at-new and steps 2/3 would fail, leaving the next inbound request
+// to repeat the 401 -> refresh -> retry loop on every call.
+func TestKiroManagerExecute_401RefreshPersistsToManagerAndStore(t *testing.T) {
+	const (
+		provider = "kiro"
+		model    = "claude-sonnet-4-5"
+		authID   = "kiro-mgr-401-persist"
+	)
+
+	script := &kiroScript{
+		t: t,
+		mainResponses: []func(http.ResponseWriter, *http.Request){
+			errorKiroResponse(http.StatusUnauthorized, `{"error":"expired token"}`, nil),
+			func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("Authorization"); got != "Bearer at-new" {
+					t.Fatalf("retry Authorization = %q, want Bearer at-new", got)
+				}
+				w.Header().Set("Content-Type", "application/octet-stream")
+				_, _ = w.Write([]byte(`binary{"content":"after-refresh"}`))
+			},
+		},
+		refreshResponses: []func(http.ResponseWriter, *http.Request){
+			successRefresh(map[string]interface{}{
+				"accessToken":  "at-new",
+				"refreshToken": "rt-rotated",
+				"expiresIn":    3600,
+			}),
+		},
+	}
+	server := httptest.NewServer(script.handler())
+	defer server.Close()
+	defer patchKiroEndpoints(t, server)()
+
+	store := newRecordingKiroStore()
+	mgr := cliproxyauth.NewManager(store, nil, nil)
+	mgr.RegisterExecutor(NewKiroExecutor(nil))
+
+	auth := newKiroAuth(authID, "at-old")
+	if _, err := mgr.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	if got := store.latestAccessToken(authID); got != "at-old" {
+		t.Fatalf("store accessToken after Register = %q, want at-old (Register persisted the initial credential)", got)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(authID) })
+	mgr.RefreshSchedulerEntry(authID)
+
+	resp, err := mgr.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Manager.Execute err = %v, want nil after 401 -> refresh -> 200", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "content.0.text").String(); got != "after-refresh" {
+		t.Fatalf("response content = %q, want after-refresh; payload=%s", got, string(resp.Payload))
+	}
+	if atomic.LoadInt32(&script.mainCalls) != 2 {
+		t.Fatalf("main calls = %d, want 2 (initial + 1 retry)", script.mainCalls)
+	}
+	if atomic.LoadInt32(&script.refreshCalls) != 1 {
+		t.Fatalf("refresh calls = %d, want exactly 1", script.refreshCalls)
+	}
+
+	// Manager-side assertion: the in-memory snapshot must reflect the new token.
+	managerAuth, ok := mgr.GetByID(authID)
+	if !ok || managerAuth == nil {
+		t.Fatalf("Manager.GetByID(%q) ok=%v, auth=%v", authID, ok, managerAuth)
+	}
+	if got := kiroMetaStr(managerAuth, "accessToken"); got != "at-new" {
+		t.Fatalf("manager accessToken = %q, want at-new (HIGH-2: refresh did not persist to manager)", got)
+	}
+	if got := kiroMetaStr(managerAuth, "refreshToken"); got != "rt-rotated" {
+		t.Fatalf("manager refreshToken = %q, want rt-rotated (rotation must persist alongside accessToken)", got)
+	}
+
+	// Store-side assertion: rotated credential must be flushed to the backing
+	// Store so the next process restart starts with the new token.
+	if got := store.latestAccessToken(authID); got != "at-new" {
+		t.Fatalf("store accessToken = %q, want at-new (HIGH-2: refresh did not persist to store)", got)
+	}
+	if got := store.saveCallsForAccessToken(authID, "at-new"); got < 1 {
+		t.Fatalf("store recorded %d Save call(s) carrying at-new, want >=1", got)
+	}
+}
+
+// TestKiroManagerExecute_401RefreshNextRequestUsesNewToken extends the HIGH-2
+// regression test by issuing a second independent Manager.Execute after the
+// refresh-retry round trip and asserting that the next request goes out with
+// at-new on the very first try (no second 401, no second refresh). This is the
+// concrete user-visible symptom HIGH-2 was about: without the fix, every
+// inbound request would repeat the 401 -> refresh -> retry loop because the
+// manager kept handing out the stale at-old token.
+func TestKiroManagerExecute_401RefreshNextRequestUsesNewToken(t *testing.T) {
+	const (
+		provider = "kiro"
+		model    = "claude-sonnet-4-5"
+		authID   = "kiro-mgr-401-next-request"
+	)
+
+	script := &kiroScript{
+		t: t,
+		mainResponses: []func(http.ResponseWriter, *http.Request){
+			errorKiroResponse(http.StatusUnauthorized, `{"error":"expired"}`, nil),
+			func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("Authorization"); got != "Bearer at-new" {
+					t.Fatalf("retry Authorization = %q, want Bearer at-new", got)
+				}
+				w.Header().Set("Content-Type", "application/octet-stream")
+				_, _ = w.Write([]byte(`binary{"content":"first-after-refresh"}`))
+			},
+			// Second inbound request must succeed on first try with at-new.
+			func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("Authorization"); got != "Bearer at-new" {
+					t.Fatalf("second request Authorization = %q, want Bearer at-new (HIGH-2 regression: manager handed out stale at-old)", got)
+				}
+				w.Header().Set("Content-Type", "application/octet-stream")
+				_, _ = w.Write([]byte(`binary{"content":"second-with-new-token"}`))
+			},
+		},
+		refreshResponses: []func(http.ResponseWriter, *http.Request){
+			successRefresh(map[string]interface{}{
+				"accessToken":  "at-new",
+				"refreshToken": "rt-rotated",
+				"expiresIn":    3600,
+			}),
+		},
+	}
+	server := httptest.NewServer(script.handler())
+	defer server.Close()
+	defer patchKiroEndpoints(t, server)()
+
+	store := newRecordingKiroStore()
+	mgr := cliproxyauth.NewManager(store, nil, nil)
+	mgr.RegisterExecutor(NewKiroExecutor(nil))
+
+	auth := newKiroAuth(authID, "at-old")
+	if _, err := mgr.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(authID) })
+	mgr.RefreshSchedulerEntry(authID)
+
+	payload := []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`)
+	if _, err := mgr.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+		t.Fatalf("first Manager.Execute err = %v, want success after refresh", err)
+	}
+	if got := atomic.LoadInt32(&script.refreshCalls); got != 1 {
+		t.Fatalf("refresh calls after first request = %d, want 1", got)
+	}
+
+	// Now run a second request. With the fix it must succeed on the first try
+	// and must NOT trigger another refresh.
+	resp, err := mgr.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("second Manager.Execute err = %v, want success on first try with persisted token", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "content.0.text").String(); got != "second-with-new-token" {
+		t.Fatalf("second response content = %q, want second-with-new-token", got)
+	}
+
+	// Hard guarantees:
+	// - Total main calls = 3 (1 initial 401 + 1 retry after refresh + 1 fresh
+	//   request that must succeed without retry).
+	// - Total refresh calls = 1 (no extra refresh for the second request).
+	if got := atomic.LoadInt32(&script.mainCalls); got != 3 {
+		t.Fatalf("total main calls = %d, want 3 (1 initial 401 + 1 retry + 1 fresh success)", got)
+	}
+	if got := atomic.LoadInt32(&script.refreshCalls); got != 1 {
+		t.Fatalf("total refresh calls = %d, want 1 (HIGH-2: stale manager token would force a 2nd refresh)", got)
 	}
 }

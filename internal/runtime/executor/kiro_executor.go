@@ -368,6 +368,10 @@ func (e *KiroExecutor) sendKiroRequest(ctx context.Context, auth *cliproxyauth.A
 	classified := classifyAndCloseKiroResponse(resp)
 
 	if classified.Class == helps.KiroErrUnauthorized {
+		refreshSource := "executor_local"
+		if cliproxyauth.ForceRefreshAuthFromContext(ctx) != nil {
+			refreshSource = "manager_persisted"
+		}
 		log.WithFields(log.Fields{
 			"event":           "refresh_attempt",
 			"provider":        e.Identifier(),
@@ -375,27 +379,30 @@ func (e *KiroExecutor) sendKiroRequest(ctx context.Context, auth *cliproxyauth.A
 			"model":           baseModel,
 			"upstream_status": classified.Status,
 			"request_id":      requestID,
+			"refresh_source":  refreshSource,
 		}).Warn("kiro executor: 401 from upstream; attempting bounded force refresh + single retry")
 
-		_, refreshErr := e.Refresh(ctx, auth)
+		refreshErr := e.refreshAuthForRetry(ctx, auth)
 		if refreshErr != nil {
 			log.WithFields(log.Fields{
-				"event":      "refresh_result",
-				"provider":   e.Identifier(),
-				"auth_id":    authID,
-				"model":      baseModel,
-				"outcome":    "failed",
-				"request_id": requestID,
+				"event":          "refresh_result",
+				"provider":       e.Identifier(),
+				"auth_id":        authID,
+				"model":          baseModel,
+				"outcome":        "failed",
+				"request_id":     requestID,
+				"refresh_source": refreshSource,
 			}).Warnf("kiro executor: refresh failed: %v", refreshErr)
 			return nil, classified
 		}
 		log.WithFields(log.Fields{
-			"event":      "refresh_result",
-			"provider":   e.Identifier(),
-			"auth_id":    authID,
-			"model":      baseModel,
-			"outcome":    "succeeded",
-			"request_id": requestID,
+			"event":          "refresh_result",
+			"provider":       e.Identifier(),
+			"auth_id":        authID,
+			"model":          baseModel,
+			"outcome":        "succeeded",
+			"request_id":     requestID,
+			"refresh_source": refreshSource,
 		}).Info("kiro executor: refresh succeeded; retrying request once")
 
 		retryResp, retryErr := e.doKiroHTTP(ctx, auth, url, cwReq)
@@ -447,6 +454,51 @@ func (e *KiroExecutor) sendKiroRequest(ctx context.Context, auth *cliproxyauth.A
 		"request_id":      requestID,
 	}).Warn("kiro executor: classified upstream error")
 	return nil, classified
+}
+
+// refreshAuthForRetry runs the bounded 401-driven refresh used by
+// sendKiroRequest. When the conductor has installed a force-refresh callback in
+// ctx (the production path), we go through Manager.ForceRefreshAuth so the new
+// credentials are also written to the manager's in-memory map and the
+// configured Store. The executor's local auth pointer is then mutated in-place
+// so the retry uses the new Authorization header. When no callback is present
+// (direct executor unit tests), we fall back to executor-local Refresh, which
+// matches the original P0-2 behavior.
+func (e *KiroExecutor) refreshAuthForRetry(ctx context.Context, auth *cliproxyauth.Auth) error {
+	if auth == nil {
+		return fmt.Errorf("kiro executor: auth is nil")
+	}
+	if fn := cliproxyauth.ForceRefreshAuthFromContext(ctx); fn != nil && auth.ID != "" {
+		updated, err := fn(ctx, auth.ID)
+		if err != nil {
+			return err
+		}
+		applyRefreshedAuthSnapshot(auth, updated)
+		return nil
+	}
+	updated, err := e.Refresh(ctx, auth)
+	if err != nil {
+		return err
+	}
+	applyRefreshedAuthSnapshot(auth, updated)
+	return nil
+}
+
+// applyRefreshedAuthSnapshot copies the refreshed credential material from
+// snapshot back onto the live auth handle so the in-flight retry observes the
+// new Authorization header. Only credential-bearing fields are copied; counters
+// and runtime state managed by the conductor are intentionally left untouched
+// to avoid accidentally clobbering recently incremented metrics.
+func applyRefreshedAuthSnapshot(auth, snapshot *cliproxyauth.Auth) {
+	if auth == nil || snapshot == nil {
+		return
+	}
+	if snapshot.Metadata != nil {
+		auth.Metadata = snapshot.Metadata
+	}
+	if !snapshot.LastRefreshedAt.IsZero() {
+		auth.LastRefreshedAt = snapshot.LastRefreshedAt
+	}
 }
 
 // doKiroHTTP issues a single HTTP request to Kiro using a fresh body reader and

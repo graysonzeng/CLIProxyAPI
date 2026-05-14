@@ -1362,6 +1362,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
+		execCtx = WithForceRefreshAuth(execCtx, m.ForceRefreshAuth)
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
@@ -1450,6 +1451,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
+		execCtx = WithForceRefreshAuth(execCtx, m.ForceRefreshAuth)
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
@@ -1537,6 +1539,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
+		execCtx = WithForceRefreshAuth(execCtx, m.ForceRefreshAuth)
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
 			continue
@@ -3608,6 +3611,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		}
 		creditsOpts := ensureRequestedModelMetadata(opts, routeModel)
 		creditsCtx = contextWithRequestedModelAlias(creditsCtx, creditsOpts, routeModel)
+		creditsCtx = WithForceRefreshAuth(creditsCtx, m.ForceRefreshAuth)
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
 		models := m.executionModelCandidates(c.auth, routeModel)
 		if len(models) == 0 {
@@ -3649,6 +3653,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 			creditsCtx = context.WithValue(creditsCtx, roundTripperContextKey{}, rt)
 			creditsCtx = context.WithValue(creditsCtx, "cliproxy.roundtripper", rt)
 		}
+		creditsCtx = WithForceRefreshAuth(creditsCtx, m.ForceRefreshAuth)
 		creditsOpts := ensureRequestedModelMetadata(opts, routeModel)
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
 		models := m.executionModelCandidates(c.auth, routeModel)
