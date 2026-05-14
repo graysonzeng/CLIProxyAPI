@@ -185,6 +185,12 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
+
+	// codexQueue owns Codex OAuth queue mode runtime state. It is lazily
+	// initialized when the queue is enabled via config and remains nil
+	// otherwise. Queue managed disabled state is never persisted.
+	codexQueueMu sync.Mutex
+	codexQueue   *CodexQueueCoordinator
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -2191,6 +2197,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 
 		auth.recordRecentRequest(now, result.Success)
+		recordRealRequestForQueue(auth.ID, now)
 		if result.Success {
 			auth.Success++
 		} else {
@@ -4287,6 +4294,82 @@ func (m *Manager) NewHttpRequest(ctx context.Context, auth *Auth, method, target
 		return nil, errPrepare
 	}
 	return httpReq, nil
+}
+
+// EnsureCodexQueueCoordinator returns (creating when necessary) the queue
+// coordinator. The provider is wired in lazily; callers that need quota probes
+// must set it via SetCodexQueueQuotaProvider before reconciling.
+func (m *Manager) EnsureCodexQueueCoordinator() *CodexQueueCoordinator {
+	if m == nil {
+		return nil
+	}
+	m.codexQueueMu.Lock()
+	defer m.codexQueueMu.Unlock()
+	if m.codexQueue == nil {
+		m.codexQueue = newCodexQueueCoordinator(m, nil)
+		SetQueueManagedDisabledChecker(m.codexQueue.IsQueueManagedDisabled)
+		SetQueueRoutingBlockedChecker(m.codexQueue.IsQueueRoutingBlocked)
+		SetQueueRealRequestRecorder(m.codexQueue.RecordRealRequest)
+	}
+	return m.codexQueue
+}
+
+// CodexQueueCoordinator returns the active coordinator, or nil when queue mode
+// has never been enabled.
+func (m *Manager) CodexQueueCoordinator() *CodexQueueCoordinator {
+	if m == nil {
+		return nil
+	}
+	m.codexQueueMu.Lock()
+	defer m.codexQueueMu.Unlock()
+	return m.codexQueue
+}
+
+// SetCodexQueueQuotaProvider injects the wham/usage probe implementation into
+// the coordinator. Passing nil clears the provider.
+func (m *Manager) SetCodexQueueQuotaProvider(provider CodexQueueQuotaProvider) {
+	if m == nil {
+		return
+	}
+	coordinator := m.EnsureCodexQueueCoordinator()
+	if coordinator != nil {
+		coordinator.SetProvider(provider)
+	}
+}
+
+// ApplyCodexQueueConfig refreshes the queue mode configuration. The coordinator
+// is started lazily when the config transitions to enabled.
+func (m *Manager) ApplyCodexQueueConfig(ctx context.Context, cfg internalconfig.CodexQueueConfig) {
+	if m == nil {
+		return
+	}
+	coordinator := m.EnsureCodexQueueCoordinator()
+	if coordinator == nil {
+		return
+	}
+	transitioned := coordinator.ApplyConfig(cfg)
+	if !cfg.Enabled {
+		if transitioned {
+			coordinator.Stop()
+		}
+		return
+	}
+	coordinator.Start(ctx)
+	if transitioned {
+		coordinator.Reconcile(ctx)
+	}
+}
+
+// StopCodexQueue stops the background coordinator loop, if any.
+func (m *Manager) StopCodexQueue() {
+	if m == nil {
+		return
+	}
+	coordinator := m.CodexQueueCoordinator()
+	if coordinator == nil {
+		return
+	}
+	coordinator.Stop()
 }
 
 // HttpRequest injects provider credentials into the supplied HTTP request and executes it.

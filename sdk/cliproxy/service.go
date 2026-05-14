@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
@@ -556,8 +557,51 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	if s.coreManager != nil {
 		s.coreManager.SetConfig(newCfg)
 		s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
+		s.applyCodexQueueConfig(newCfg)
 	}
 	s.rebindExecutors()
+}
+
+// applyCodexQueueConfig wires the Codex OAuth queue coordinator with the
+// latest config and ensures the quota probe provider is registered. The
+// provider is always wired so management toggles arriving before the next
+// watcher reload still have a working coordinator. Disabling the queue stops
+// the coordinator and clears queue-managed disabled state.
+func (s *Service) applyCodexQueueConfig(newCfg *config.Config) {
+	if s == nil || s.coreManager == nil || newCfg == nil {
+		return
+	}
+	queueCfg := newCfg.Routing.CodexQueue
+	queueCfg.Normalize()
+	provider := helps.NewCodexQueueQuotaProvider(func() *config.Config {
+		s.cfgMu.RLock()
+		defer s.cfgMu.RUnlock()
+		return s.cfg
+	})
+	s.coreManager.SetCodexQueueQuotaProvider(provider)
+	s.coreManager.ApplyCodexQueueConfig(context.Background(), queueCfg)
+}
+
+// applyCodexQueueConfigFromManagement persists the supplied config in the
+// active service snapshot and then applies it. The management handler calls
+// this whenever routing.codex-queue is mutated via the API so the queue
+// coordinator and quota provider are reconciled before the next watcher
+// reload.
+func (s *Service) applyCodexQueueConfigFromManagement(queueCfg config.CodexQueueConfig) {
+	if s == nil {
+		return
+	}
+	queueCfg.Normalize()
+	s.cfgMu.Lock()
+	if s.cfg != nil {
+		s.cfg.Routing.CodexQueue = queueCfg
+	}
+	cfg := s.cfg
+	s.cfgMu.Unlock()
+	if cfg == nil {
+		return
+	}
+	s.applyCodexQueueConfig(cfg)
 }
 
 func forceHomeRuntimeConfig(cfg *config.Config) {
@@ -806,6 +850,16 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
+
+	// Register the queue mode applier so management API toggles wire the
+	// quota provider before the next watcher reload.
+	s.server.SetCodexQueueConfigApplier(s.applyCodexQueueConfigFromManagement)
+
+	// Wire the queue coordinator from the persisted config so a server
+	// started with routing.codex-queue.enabled=true is functional before
+	// the first config reload. This must run after the core manager is
+	// constructed and before traffic is served.
+	s.applyCodexQueueConfig(s.cfg)
 
 	if s.authManager == nil {
 		s.authManager = newDefaultAuthManager()

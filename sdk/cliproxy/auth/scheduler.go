@@ -515,6 +515,10 @@ func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) {
 		s.removeAuthLocked(authID)
 		return
 	}
+	if isQueueRoutingBlocked(authID) {
+		s.removeAuthLocked(authID)
+		return
+	}
 	if previousProvider := s.authProviders[authID]; previousProvider != "" && previousProvider != providerKey {
 		if previousState := s.providers[previousProvider]; previousState != nil {
 			previousState.removeAuthLocked(authID)

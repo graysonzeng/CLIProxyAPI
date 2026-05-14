@@ -434,6 +434,21 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
 	}
+	if queueState := h.collectCodexQueueState(auth); queueState != nil {
+		entry["queue_state"] = queueState["state"]
+		entry["queue_group"] = queueState["group"]
+		entry["queue_position"] = queueState["position"]
+		entry["queue_managed_disabled"] = queueState["managed_disabled"]
+		if reason, ok := queueState["disabled_reason"].(string); ok && reason != "" {
+			entry["queue_disabled_reason"] = reason
+		}
+		if quota, ok := queueState["quota"]; ok {
+			entry["quota_snapshot"] = quota
+		}
+		if ts, ok := queueState["last_real_request_at"].(time.Time); ok && !ts.IsZero() {
+			entry["last_real_request_at"] = ts
+		}
+	}
 	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
 	if p := strings.TrimSpace(authAttribute(auth, "priority")); p != "" {
@@ -466,6 +481,32 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		}
 	}
 	return entry
+}
+
+// collectCodexQueueState returns a per-auth queue state map ready for inclusion
+// in the auth-files API response. It returns nil when no queue coordinator is
+// running or the auth is not currently in a queue group.
+func (h *Handler) collectCodexQueueState(auth *coreauth.Auth) gin.H {
+	if h == nil || h.authManager == nil || auth == nil {
+		return nil
+	}
+	coordinator := h.authManager.CodexQueueCoordinator()
+	if coordinator == nil || !coordinator.Enabled() {
+		return nil
+	}
+	state := coordinator.AuthState(auth.ID)
+	if state == nil {
+		return nil
+	}
+	return gin.H{
+		"state":                state.QueueState,
+		"group":                state.QueueGroup,
+		"position":             state.QueuePosition,
+		"managed_disabled":     state.QueueManagedDisabled,
+		"disabled_reason":      state.QueueDisabledReason,
+		"quota":                state.Quota,
+		"last_real_request_at": state.LastRealRequestAt,
+	}
 }
 
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {

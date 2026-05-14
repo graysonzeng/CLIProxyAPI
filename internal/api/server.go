@@ -59,6 +59,7 @@ type serverOptionConfig struct {
 	keepAliveTimeout     time.Duration
 	keepAliveOnTimeout   func()
 	postAuthHook         auth.PostAuthHook
+	codexQueueApplier    func(cfg config.CodexQueueConfig)
 }
 
 // ServerOption customises HTTP server construction.
@@ -123,6 +124,16 @@ func WithRequestLoggerFactory(factory func(*config.Config, string) logging.Reque
 func WithPostAuthHook(hook auth.PostAuthHook) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.postAuthHook = hook
+	}
+}
+
+// WithCodexQueueConfigApplier registers a service-level applier used when the
+// management API mutates routing.codex-queue. The Service is expected to wire
+// the quota provider before applying the new config so management toggles
+// take effect immediately without waiting for a watcher reload.
+func WithCodexQueueConfigApplier(fn func(cfg config.CodexQueueConfig)) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.codexQueueApplier = fn
 	}
 }
 
@@ -286,6 +297,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.mgmt.SetLogDirectory(logDir)
 	if optionState.postAuthHook != nil {
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
+	}
+	if optionState.codexQueueApplier != nil {
+		s.mgmt.SetCodexQueueConfigApplier(optionState.codexQueueApplier)
 	}
 	s.localPassword = optionState.localPassword
 
@@ -639,6 +653,12 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
 		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
 		mgmt.PATCH("/routing/strategy", s.mgmt.PutRoutingStrategy)
+
+		mgmt.GET("/routing/codex-queue", s.mgmt.GetCodexQueueConfig)
+		mgmt.PUT("/routing/codex-queue", s.mgmt.PutCodexQueueConfig)
+		mgmt.PATCH("/routing/codex-queue", s.mgmt.PutCodexQueueConfig)
+		mgmt.GET("/routing/codex-queue/state", s.mgmt.GetCodexQueueState)
+		mgmt.POST("/routing/codex-queue/reset", s.mgmt.ResetCodexQueueAuth)
 
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
@@ -1340,6 +1360,17 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		vertexAICompatCount,
 		openAICompatCount,
 	)
+}
+
+// SetCodexQueueConfigApplier registers a callback invoked by the management
+// API when routing.codex-queue is mutated. The Service uses this to wire the
+// quota provider before applying the new config so management toggles take
+// effect immediately.
+func (s *Server) SetCodexQueueConfigApplier(fn func(cfg config.CodexQueueConfig)) {
+	if s == nil || s.mgmt == nil {
+		return
+	}
+	s.mgmt.SetCodexQueueConfigApplier(fn)
 }
 
 func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {

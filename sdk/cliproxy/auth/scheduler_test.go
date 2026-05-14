@@ -6,9 +6,25 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+// defaultQueueConfigForSchedulerTest returns a normalized queue config suitable
+// for scheduler-integration tests.
+func defaultQueueConfigForSchedulerTest(autoDisable bool) internalconfig.CodexQueueConfig {
+	v := autoDisable
+	cfg := internalconfig.CodexQueueConfig{
+		Enabled:            true,
+		ThresholdPercent:   10,
+		IdleWindow:         "5m",
+		UnknownQuotaPolicy: internalconfig.CodexQueueUnknownQuotaPolicySkip,
+		AutoDisableCurrent: &v,
+	}
+	cfg.Normalize()
+	return cfg
+}
 
 type schedulerTestExecutor struct{}
 
@@ -230,6 +246,95 @@ func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledAcrossPriorities(t *
 		}
 		if got.ID != wantID {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
+		}
+	}
+}
+
+// TestSchedulerPick_CodexQueueModeOnlyPicksActive proves the CRITICAL queue
+// invariant end-to-end: with round-robin selection enabled and two healthy
+// equivalent Codex auths registered, the scheduler must return only the
+// elected active auth while queue mode is enabled.
+//
+// This is a regression for the bug where standby members stayed in scheduler
+// ready buckets even after queue mode was turned on, defeating "one active
+// at a time" until a low-quota promotion forced an auto-disable.
+func TestSchedulerPick_CodexQueueModeOnlyPicksActive(t *testing.T) {
+	// Cannot run in parallel: this test mutates the package-level queue
+	// routing-block checker.
+	manager := NewManager(nil, nil, nil)
+	coordinator := manager.EnsureCodexQueueCoordinator()
+	t.Cleanup(func() {
+		coordinator.Stop()
+		SetQueueManagedDisabledChecker(nil)
+		SetQueueRoutingBlockedChecker(nil)
+		SetQueueRealRequestRecorder(nil)
+	})
+
+	a1 := &Auth{
+		ID:       "codex-a",
+		Provider: "codex",
+		Prefix:   "team",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "team",
+		},
+		Metadata: map[string]any{"access_token": "tkn", "account_id": "acct"},
+	}
+	a2 := &Auth{
+		ID:       "codex-b",
+		Provider: "codex",
+		Prefix:   "team",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "team",
+		},
+		Metadata: map[string]any{"access_token": "tkn", "account_id": "acct"},
+	}
+	if _, err := manager.Register(context.Background(), a1); err != nil {
+		t.Fatalf("register a1: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), a2); err != nil {
+		t.Fatalf("register a2: %v", err)
+	}
+	registerSchedulerModels(t, "codex", "", "codex-a", "codex-b")
+	manager.RefreshSchedulerEntry("codex-a")
+	manager.RefreshSchedulerEntry("codex-b")
+
+	autoDisable := true
+	cfg := struct {
+		Enabled bool
+	}{Enabled: true}
+	_ = cfg
+	queueCfg := defaultQueueConfigForSchedulerTest(autoDisable)
+	coordinator.ApplyConfig(queueCfg)
+	coordinator.SetProvider(CodexQueueQuotaProviderFunc(func(ctx context.Context, auth *Auth) (CodexQuotaSnapshot, error) {
+		return CodexQuotaSnapshot{
+			PrimaryWindow: QuotaWindowSnapshot{PercentRemaining: 80, WindowMinutes: 300},
+			Status:        CodexQuotaStatusKnown,
+		}, nil
+	}))
+	coordinator.Reconcile(context.Background())
+
+	groups := coordinator.Groups()
+	if len(groups) != 1 {
+		t.Fatalf("expected single group, got %d", len(groups))
+	}
+	activeID := groups[0].ActiveAuthID
+	if activeID == "" {
+		t.Fatalf("expected an active auth")
+	}
+
+	// Round-robin should still only return the active across many picks.
+	for i := 0; i < 5; i++ {
+		got, errPick := manager.scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle #%d error = %v", i, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle #%d returned nil auth", i)
+		}
+		if got.ID != activeID {
+			t.Fatalf("pickSingle #%d returned %q, expected only active %q while queue mode is on", i, got.ID, activeID)
 		}
 	}
 }

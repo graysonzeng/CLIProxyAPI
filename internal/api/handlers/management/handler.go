@@ -46,6 +46,11 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	// codexQueueApply is invoked when the management API mutates the
+	// routing.codex-queue configuration. The Service registers this hook so
+	// the queue coordinator's quota provider is wired before the new config
+	// is applied; falling back to the auth manager when nil.
+	codexQueueApply func(cfg config.CodexQueueConfig)
 }
 
 // NewHandler creates a new management handler instance.
@@ -140,6 +145,20 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
+}
+
+// SetCodexQueueConfigApplier registers a service-level callback invoked when
+// the management API mutates routing.codex-queue. The callback should both
+// (re)wire the quota provider and apply the queue configuration to the
+// coordinator so the management toggle is functional without waiting for a
+// watcher reload.
+func (h *Handler) SetCodexQueueConfigApplier(fn func(cfg config.CodexQueueConfig)) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.codexQueueApply = fn
+	h.mu.Unlock()
 }
 
 // Middleware enforces access control for management endpoints.

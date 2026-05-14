@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	log "github.com/sirupsen/logrus"
@@ -238,6 +239,161 @@ type RoutingConfig struct {
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+
+	// CodexQueue configures the opt-in Codex OAuth queue mode that draws one
+	// Codex auth at a time within an equivalent group, switching when any known
+	// quota window is below threshold and the active auth has been idle for the
+	// configured window. See docs/superpowers/specs/2026-05-14-codex-oauth-queue-mode-design.md.
+	CodexQueue CodexQueueConfig `yaml:"codex-queue,omitempty" json:"codex-queue,omitempty"`
+}
+
+// CodexQueueConfig configures Codex OAuth queue mode.
+//
+// All fields are runtime configuration only: queue-managed state lives in
+// memory in the auth manager and is never persisted to auth files, OAuth
+// token material, or `Auth.Metadata`.
+type CodexQueueConfig struct {
+	// Enabled toggles queue mode. When false the coordinator does not mutate
+	// auth state and the normal routing strategy remains authoritative.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+
+	// ThresholdPercent is the remaining-percentage gate that, when crossed by
+	// any known Codex usage window, marks the active auth as switch-pending.
+	// Valid range (0, 100]. Default: 10.
+	ThresholdPercent float64 `yaml:"threshold-percent,omitempty" json:"threshold-percent,omitempty"`
+
+	// IdleWindow is the sliding "no new real requests" window required before
+	// the coordinator may switch off the active auth once it is switch-pending.
+	// Accepts Go duration strings (e.g. "10m", "5m30s"). Default: 10m.
+	IdleWindow string `yaml:"idle-window,omitempty" json:"idle-window,omitempty"`
+
+	// UnknownQuotaPolicy controls how the coordinator treats an auth with no
+	// known quota snapshot. Supported values:
+	//   - "skip" (default): never promote an auth whose quota is unknown.
+	//   - "promote": treat unknown quota as fully available.
+	UnknownQuotaPolicy string `yaml:"unknown-quota-policy,omitempty" json:"unknown-quota-policy,omitempty"`
+
+	// AutoDisableCurrent allows the coordinator to mark the current low-quota
+	// auth as queue-managed disabled (removed from scheduler routing) when a
+	// quota-available candidate exists. Defaults to true.
+	AutoDisableCurrent *bool `yaml:"auto-disable-current,omitempty" json:"auto-disable-current,omitempty"`
+
+	// GroupBy lists the equivalence keys used to compute group membership.
+	// Each entry must be one of: "prefix", "models", "websockets", "headers",
+	// "plan_type". Unknown values are dropped during sanitation. Default order:
+	// ["prefix", "models", "websockets", "headers", "plan_type"].
+	GroupBy []string `yaml:"group-by,omitempty" json:"group-by,omitempty"`
+}
+
+// Default constants for the Codex queue config.
+const (
+	CodexQueueDefaultThresholdPercent   = 10.0
+	CodexQueueDefaultIdleWindow         = "10m"
+	CodexQueueUnknownQuotaPolicySkip    = "skip"
+	CodexQueueUnknownQuotaPolicyPromote = "promote"
+)
+
+// codexQueueDefaultGroupBy is the default equivalence-key set used when the
+// user has not configured a custom one. Keep order stable to make group keys
+// reproducible across processes.
+var codexQueueDefaultGroupBy = []string{"prefix", "models", "websockets", "headers", "plan_type"}
+
+// codexQueueValidGroupBy enumerates the allowed group_by tokens.
+var codexQueueValidGroupBy = map[string]struct{}{
+	"prefix":     {},
+	"models":     {},
+	"websockets": {},
+	"headers":    {},
+	"plan_type":  {},
+}
+
+// Normalize fills in defaults and clamps invalid values. It must be safe to
+// call repeatedly (e.g. after each hot reload).
+func (c *CodexQueueConfig) Normalize() {
+	if c == nil {
+		return
+	}
+	if c.ThresholdPercent <= 0 || c.ThresholdPercent > 100 {
+		c.ThresholdPercent = CodexQueueDefaultThresholdPercent
+	}
+	if strings.TrimSpace(c.IdleWindow) == "" {
+		c.IdleWindow = CodexQueueDefaultIdleWindow
+	}
+	policy := strings.ToLower(strings.TrimSpace(c.UnknownQuotaPolicy))
+	switch policy {
+	case CodexQueueUnknownQuotaPolicyPromote:
+		c.UnknownQuotaPolicy = CodexQueueUnknownQuotaPolicyPromote
+	default:
+		c.UnknownQuotaPolicy = CodexQueueUnknownQuotaPolicySkip
+	}
+	if c.AutoDisableCurrent == nil {
+		v := true
+		c.AutoDisableCurrent = &v
+	}
+	c.GroupBy = sanitizeCodexQueueGroupBy(c.GroupBy)
+}
+
+// IdleWindowDuration parses the configured idle window into a time.Duration.
+// It returns the default 10m duration when the value is unset or invalid.
+func (c CodexQueueConfig) IdleWindowDuration() time.Duration {
+	value := strings.TrimSpace(c.IdleWindow)
+	if value == "" {
+		value = CodexQueueDefaultIdleWindow
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		fallback, _ := time.ParseDuration(CodexQueueDefaultIdleWindow)
+		return fallback
+	}
+	return parsed
+}
+
+// AutoDisableCurrentEnabled returns the effective auto-disable flag, defaulting
+// to true when the pointer is nil.
+func (c CodexQueueConfig) AutoDisableCurrentEnabled() bool {
+	if c.AutoDisableCurrent == nil {
+		return true
+	}
+	return *c.AutoDisableCurrent
+}
+
+// EffectiveGroupBy returns the sanitized group_by list, falling back to the
+// default when none is configured.
+func (c CodexQueueConfig) EffectiveGroupBy() []string {
+	if len(c.GroupBy) == 0 {
+		out := make([]string, len(codexQueueDefaultGroupBy))
+		copy(out, codexQueueDefaultGroupBy)
+		return out
+	}
+	out := make([]string, len(c.GroupBy))
+	copy(out, c.GroupBy)
+	return out
+}
+
+func sanitizeCodexQueueGroupBy(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		key := strings.ToLower(strings.TrimSpace(raw))
+		if key == "" {
+			continue
+		}
+		if _, ok := codexQueueValidGroupBy[key]; !ok {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -727,6 +883,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
+
+	// Normalize Codex queue mode defaults.
+	cfg.Routing.CodexQueue.Normalize()
 
 	// NOTE: Legacy migration persistence is intentionally disabled together with
 	// startup legacy migration to keep startup read-only for config.yaml.
