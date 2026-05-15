@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -21,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 
 	// Register protocol translators for executor translation regression tests.
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
@@ -433,6 +436,26 @@ func TestStreamKiroToClaudeSSE_MalformedBeforePayloadReturnsError(t *testing.T) 
 	}
 }
 
+func TestStreamKiroToClaudeSSE_MalformedAfterPayloadStillCompletes(t *testing.T) {
+	var lines []string
+	result, err := streamKiroToClaudeSSE(context.Background(), strings.NewReader(`binary{"content":"Hello"}binary{"content":"oops"`), nil, "claude-sonnet-4-5", func(line []byte) {
+		lines = append(lines, string(line))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v, want nil after payload started", err)
+	}
+	if !result.payloadStarted {
+		t.Fatalf("payloadStarted = false, want true")
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "text_delta") || !strings.Contains(joined, "Hello") {
+		t.Fatalf("stream did not emit first payload: %s", joined)
+	}
+	if !strings.Contains(joined, "message_stop") {
+		t.Fatalf("stream should emit terminal success events after trailing malformed residue: %s", joined)
+	}
+}
+
 func TestStreamKiroToClaudeSSE_ReadErrorAfterPayloadDoesNotEmitStop(t *testing.T) {
 	readErr := errors.New("connection reset")
 	reader := &errorAfterChunksReader{chunks: []string{`binary{"content": "Hello"}`}, err: readErr}
@@ -719,6 +742,14 @@ func TestKiroThinkingPipelineIntegration(t *testing.T) {
 			wantThinkingPrefix: true,
 		},
 		{
+			name:               "claude code default budget clamps to kiro max",
+			model:              "claude-sonnet-4-5",
+			body:               `{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":31999}}`,
+			wantThinkingType:   "enabled",
+			wantMaxBudget:      24576,
+			wantThinkingPrefix: true,
+		},
+		{
 			name:               "no thinking config passthrough",
 			model:              "claude-sonnet-4-5",
 			body:               `{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`,
@@ -764,7 +795,9 @@ func TestKiroThinkingPipelineIntegration(t *testing.T) {
 			}
 
 			// Verify buildKiroCodeWhispererRequest consumes the processed thinking.
-			cwReq, _, errBuild := buildKiroCodeWhispererRequest(processed, nil)
+			// Default effort "" exercises the medium fallback so this test reflects
+			// production behavior when KiroConfig is unset.
+			cwReq, _, errBuild := buildKiroCodeWhispererRequest(processed, nil, "")
 			if errBuild != nil {
 				t.Fatalf("buildKiroCodeWhispererRequest error: %v", errBuild)
 			}
@@ -1202,7 +1235,9 @@ func TestKiroThinkingAdaptiveEffort(t *testing.T) {
 	}
 
 	// Verify buildKiroCodeWhispererRequest reads the effort and generates the correct prefix.
-	cwReq, _, errBuild := buildKiroCodeWhispererRequest(processed, nil)
+	// Default effort "" exercises the medium fallback for enabled+budget rewrites,
+	// but explicit adaptive+high from the user must still win and be preserved.
+	cwReq, _, errBuild := buildKiroCodeWhispererRequest(processed, nil, "")
 	if errBuild != nil {
 		t.Fatalf("buildKiroCodeWhispererRequest error: %v", errBuild)
 	}
@@ -1216,6 +1251,190 @@ func TestKiroThinkingAdaptiveEffort(t *testing.T) {
 	}
 	if !strings.Contains(cwStr, "high") {
 		t.Error("expected effort=high in CodeWhisperer request")
+	}
+}
+
+// TestKiroEnabledBudgetRewriteToAdaptive guards the Kiro Opus 4.6 reliability
+// fix: client `thinking.type=enabled` requests (the shape Claude Code sends by
+// default) must be rewritten to Kiro's `adaptive` thinking mode at the
+// configured effort, instead of being forwarded as `enabled+budget` which
+// triggers the no-visible-text upstream regression in 25-50% of measured
+// requests. Explicit `(none)` or `(high)` user choices must not be touched.
+func TestKiroEnabledBudgetRewriteToAdaptive(t *testing.T) {
+	tests := []struct {
+		name           string
+		thinkingJSON   string
+		defaultEffort  string
+		wantMode       string // "adaptive", "enabled", or "" (no prefix)
+		wantEffort     string // when wantMode==adaptive
+		wantBudget     int    // when wantMode==enabled
+		forbidContains []string
+	}{
+		{
+			name:          "claude code default budget rewrites to adaptive medium",
+			thinkingJSON:  `{"type":"enabled","budget_tokens":31999}`,
+			defaultEffort: "",
+			wantMode:      "adaptive",
+			wantEffort:    "medium",
+			forbidContains: []string{
+				// The legacy enabled+max_thinking_length path must not appear,
+				// otherwise the high-budget no-output failure mode is reachable.
+				"max_thinking_length",
+			},
+		},
+		{
+			name:          "operator override to high is honored",
+			thinkingJSON:  `{"type":"enabled","budget_tokens":24576}`,
+			defaultEffort: "high",
+			wantMode:      "adaptive",
+			wantEffort:    "high",
+		},
+		{
+			name:          "operator preserve keeps enabled+budget verbatim",
+			thinkingJSON:  `{"type":"enabled","budget_tokens":24576}`,
+			defaultEffort: "preserve",
+			wantMode:      "enabled",
+			wantBudget:    24576,
+		},
+		{
+			name:          "explicit adaptive low always wins over default high",
+			thinkingJSON:  `{"type":"adaptive"}`,
+			defaultEffort: "high",
+			wantMode:      "adaptive",
+			wantEffort:    "low",
+			// Explicit user choice arrives via output_config.effort; injected below.
+		},
+		{
+			name:          "disabled remains disabled",
+			thinkingJSON:  `{"type":"disabled"}`,
+			defaultEffort: "medium",
+			wantMode:      "",
+			forbidContains: []string{
+				"thinking_mode",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":"hi"}],"thinking":` + tt.thinkingJSON + `}`)
+			// For the "explicit adaptive" case, inject output_config.effort=low so
+			// the executor reads it from the canonical location.
+			if tt.name == "explicit adaptive low always wins over default high" {
+				var err error
+				body, err = sjson.SetBytes(body, "output_config.effort", "low")
+				if err != nil {
+					t.Fatalf("sjson.SetBytes: %v", err)
+				}
+			}
+
+			cwReq, _, errBuild := buildKiroCodeWhispererRequest(body, nil, tt.defaultEffort)
+			if errBuild != nil {
+				t.Fatalf("buildKiroCodeWhispererRequest error: %v", errBuild)
+			}
+			// The prompt prefix is embedded as JSON-encoded text inside the
+			// userInputMessage.content field. Decode it before asserting on
+			// the literal `<thinking_mode>` markup we care about.
+			content := gjson.GetBytes(cwReq, "conversationState.currentMessage.userInputMessage.content").String()
+
+			for _, forbidden := range tt.forbidContains {
+				if strings.Contains(content, forbidden) {
+					t.Errorf("prompt must not contain %q; content=%q", forbidden, content)
+				}
+			}
+
+			switch tt.wantMode {
+			case "":
+				if strings.Contains(content, "thinking_mode") {
+					t.Errorf("expected no thinking prefix; content=%q", content)
+				}
+			case "adaptive":
+				if !strings.Contains(content, "<thinking_mode>adaptive</thinking_mode>") {
+					t.Errorf("expected adaptive mode tag; content=%q", content)
+				}
+				if tt.wantEffort != "" {
+					want := "<thinking_effort>" + tt.wantEffort + "</thinking_effort>"
+					if !strings.Contains(content, want) {
+						t.Errorf("expected effort %q; content=%q", tt.wantEffort, content)
+					}
+				}
+			case "enabled":
+				if !strings.Contains(content, "<thinking_mode>enabled</thinking_mode>") {
+					t.Errorf("expected enabled mode tag; content=%q", content)
+				}
+				if tt.wantBudget > 0 {
+					want := fmt.Sprintf("<max_thinking_length>%d</max_thinking_length>", tt.wantBudget)
+					if !strings.Contains(content, want) {
+						t.Errorf("expected budget %d preserved; content=%q", tt.wantBudget, content)
+					}
+				}
+			default:
+				t.Fatalf("unsupported wantMode %q", tt.wantMode)
+			}
+		})
+	}
+}
+
+// TestKiroExecutor_HttpClientForRoutesProxyVsShared verifies the keep-alive
+// optimization's selector logic: requests without a per-auth/global proxy and
+// without a context-injected RoundTripper must use the shared singleton client
+// (so idle connections to the AWS CodeWhisperer endpoint can be pooled across
+// requests). Requests with a proxy URL or a custom RoundTripper must still go
+// through the legacy NewProxyAwareHTTPClient path so users relying on those
+// features see no behavior change.
+func TestKiroExecutor_HttpClientForRoutesProxyVsShared(t *testing.T) {
+	shared := helps.KiroSharedHTTPClient()
+	t.Run("default path returns shared singleton (keep-alive enabled)", func(t *testing.T) {
+		e := NewKiroExecutor(nil)
+		got := e.httpClientFor(context.Background(), &cliproxyauth.Auth{Provider: "kiro"})
+		if got != shared {
+			t.Errorf("expected shared singleton client, got distinct pointer")
+		}
+	})
+	t.Run("auth proxy URL forces fresh transport", func(t *testing.T) {
+		e := NewKiroExecutor(nil)
+		got := e.httpClientFor(context.Background(), &cliproxyauth.Auth{Provider: "kiro", ProxyURL: "http://127.0.0.1:1"})
+		if got == shared {
+			t.Errorf("auth proxy URL must bypass shared client to honor per-auth proxy routing")
+		}
+	})
+	t.Run("global proxy URL forces fresh transport", func(t *testing.T) {
+		e := NewKiroExecutor(&config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://127.0.0.1:1"}})
+		got := e.httpClientFor(context.Background(), &cliproxyauth.Auth{Provider: "kiro"})
+		if got == shared {
+			t.Errorf("global proxy URL must bypass shared client to honor cfg.ProxyURL")
+		}
+	})
+	t.Run("context RoundTripper is honored", func(t *testing.T) {
+		e := NewKiroExecutor(nil)
+		ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(http.DefaultTransport))
+		got := e.httpClientFor(ctx, &cliproxyauth.Auth{Provider: "kiro"})
+		if got == shared {
+			t.Errorf("context-injected RoundTripper must bypass shared client so callers can override transport")
+		}
+	})
+}
+
+// TestKiroExecutor_DefaultThinkingEffortFromConfig verifies that the executor
+// pulls the configured default effort from cfg.Kiro and forwards it to the
+// builder, so operators can switch the rewrite target via YAML alone.
+func TestKiroExecutor_DefaultThinkingEffortFromConfig(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		cfg  *config.Config
+		want string
+	}{
+		{name: "nil cfg returns empty (helper falls back to medium)", cfg: nil, want: ""},
+		{name: "empty cfg returns empty", cfg: &config.Config{}, want: ""},
+		{name: "configured high", cfg: &config.Config{Kiro: config.KiroConfig{DefaultThinkingEffort: "high"}}, want: "high"},
+		{name: "configured preserve", cfg: &config.Config{Kiro: config.KiroConfig{DefaultThinkingEffort: "preserve"}}, want: "preserve"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			e := NewKiroExecutor(tt.cfg)
+			if got := e.kiroDefaultThinkingEffort(); got != tt.want {
+				t.Errorf("kiroDefaultThinkingEffort() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1944,5 +2163,279 @@ func TestKiroManagerExecute_401RefreshNextRequestUsesNewToken(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&script.refreshCalls); got != 1 {
 		t.Fatalf("total refresh calls = %d, want 1 (HIGH-2: stale manager token would force a 2nd refresh)", got)
+	}
+}
+
+// --- Kiro thinking streaming state-machine regression coverage ---
+//
+// The following tests pin down the contract that Kiro `<thinking>...</thinking>`
+// markup must never leak into Claude `text_delta` events, even when the tags
+// (or their bodies) are split across multiple Kiro `content` events. They also
+// verify that history rebuilders strip already-leaked thinking markup so that
+// multi-turn conversations do not keep poisoning the Kiro context window.
+
+// streamSSESummary parses an SSE byte stream emitted by streamKiroToClaudeSSE
+// into a flat representation that is easy to assert against.
+type streamSSESummary struct {
+	textDeltas     []string
+	thinkingDeltas []string
+	blockStarts    []string // content_block_start "type" values, in order
+	blockStops     int
+	hasMessageStop bool
+}
+
+func summarizeKiroSSELines(lines []string) streamSSESummary {
+	var s streamSSESummary
+	for _, line := range lines {
+		for _, dataLine := range strings.Split(line, "\n") {
+			dataLine = strings.TrimSpace(dataLine)
+			if !strings.HasPrefix(dataLine, "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(dataLine, "data:"))
+			eventType := gjson.Get(payload, "type").String()
+			switch eventType {
+			case "content_block_start":
+				s.blockStarts = append(s.blockStarts, gjson.Get(payload, "content_block.type").String())
+			case "content_block_delta":
+				deltaType := gjson.Get(payload, "delta.type").String()
+				switch deltaType {
+				case "text_delta":
+					s.textDeltas = append(s.textDeltas, gjson.Get(payload, "delta.text").String())
+				case "thinking_delta":
+					s.thinkingDeltas = append(s.thinkingDeltas, gjson.Get(payload, "delta.thinking").String())
+				}
+			case "content_block_stop":
+				s.blockStops++
+			case "message_stop":
+				s.hasMessageStop = true
+			}
+		}
+	}
+	return s
+}
+
+func runKiroStreamSSE(t *testing.T, raw string) streamSSESummary {
+	t.Helper()
+	var lines []string
+	result, err := streamKiroToClaudeSSE(context.Background(), strings.NewReader(raw), nil, "claude-sonnet-4-5", func(line []byte) {
+		lines = append(lines, string(line))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v, want nil", err)
+	}
+	if !result.payloadStarted {
+		t.Fatalf("payloadStarted = false, want true")
+	}
+	return summarizeKiroSSELines(lines)
+}
+
+// TestStreamKiroToClaudeSSE_ThinkingStartTagSplitAcrossEvents verifies that a
+// `<thinking>` opening tag arriving in one Kiro `content` event followed by the
+// reasoning body and `</thinking>` in subsequent events is rendered as a single
+// thinking block instead of leaking the body and closing tag as text_delta.
+func TestStreamKiroToClaudeSSE_ThinkingStartTagSplitAcrossEvents(t *testing.T) {
+	raw := `binary{"content":"<thinking>"}` +
+		`binary{"content":"Internal reasoning here."}` +
+		`binary{"content":"</thinking>\n\nFinal answer."}`
+
+	summary := runKiroStreamSSE(t, raw)
+
+	joinedText := strings.Join(summary.textDeltas, "")
+	if strings.Contains(joinedText, "<thinking>") || strings.Contains(joinedText, "</thinking>") {
+		t.Fatalf("text_delta leaked thinking markup: %q", joinedText)
+	}
+	if strings.Contains(joinedText, "Internal reasoning here.") {
+		t.Fatalf("text_delta leaked thinking body: %q", joinedText)
+	}
+	if joinedText != "Final answer." {
+		t.Fatalf("text_delta content = %q, want %q", joinedText, "Final answer.")
+	}
+
+	joinedThinking := strings.Join(summary.thinkingDeltas, "")
+	if !strings.Contains(joinedThinking, "Internal reasoning here.") {
+		t.Fatalf("thinking_delta missing reasoning body: %q", joinedThinking)
+	}
+	if strings.Contains(joinedThinking, "<thinking>") || strings.Contains(joinedThinking, "</thinking>") {
+		t.Fatalf("thinking_delta should not contain raw tags: %q", joinedThinking)
+	}
+
+	thinkingStarts := 0
+	for _, blockType := range summary.blockStarts {
+		if blockType == "thinking" {
+			thinkingStarts++
+		}
+	}
+	if thinkingStarts != 1 {
+		t.Fatalf("expected exactly 1 thinking content_block_start, got %d (starts=%v)", thinkingStarts, summary.blockStarts)
+	}
+}
+
+// TestStreamKiroToClaudeSSE_ThinkingBodyAndCloseSplit verifies the case where
+// the start tag and part of the body share an event but the closing tag and the
+// final answer arrive in a later event. Kiro upstream commonly chunks like this.
+func TestStreamKiroToClaudeSSE_ThinkingBodyAndCloseSplit(t *testing.T) {
+	raw := `binary{"content":"<thinking>\nLet me think"}` +
+		`binary{"content":" carefully.</thinking>\n\nReady."}`
+
+	summary := runKiroStreamSSE(t, raw)
+
+	joinedText := strings.Join(summary.textDeltas, "")
+	if strings.Contains(joinedText, "</thinking>") || strings.Contains(joinedText, "Let me think") {
+		t.Fatalf("text_delta leaked thinking content: %q", joinedText)
+	}
+	if joinedText != "Ready." {
+		t.Fatalf("text_delta content = %q, want %q", joinedText, "Ready.")
+	}
+
+	joinedThinking := strings.Join(summary.thinkingDeltas, "")
+	if !strings.Contains(joinedThinking, "Let me think") || !strings.Contains(joinedThinking, "carefully.") {
+		t.Fatalf("thinking_delta should contain both halves of reasoning: %q", joinedThinking)
+	}
+}
+
+// TestStreamKiroToClaudeSSE_ThinkingClosesInSameEventWithSuffix verifies the
+// happy path where a single Kiro content event carries the entire
+// `<thinking>...</thinking>` block plus a visible suffix.
+func TestStreamKiroToClaudeSSE_ThinkingClosesInSameEventWithSuffix(t *testing.T) {
+	raw := `binary{"content":"<thinking>quick thought</thinking>\n\nDone."}`
+
+	summary := runKiroStreamSSE(t, raw)
+
+	joinedText := strings.Join(summary.textDeltas, "")
+	if joinedText != "Done." {
+		t.Fatalf("text_delta content = %q, want %q", joinedText, "Done.")
+	}
+	if got := strings.Join(summary.thinkingDeltas, ""); got != "quick thought" {
+		t.Fatalf("thinking_delta = %q, want %q", got, "quick thought")
+	}
+}
+
+// TestStreamKiroToClaudeSSE_ThinkingUnclosedAtEOFDoesNotLeak verifies that when
+// the upstream stream ends in the middle of a thinking block, the partial
+// reasoning is not promoted to a visible text_delta. The proxy may flush it as
+// thinking_delta (or drop it entirely), but it must never reach the user.
+func TestStreamKiroToClaudeSSE_ThinkingUnclosedAtEOFDoesNotLeak(t *testing.T) {
+	raw := `binary{"content":"prefix <thinking>"}` +
+		`binary{"content":"never closed reasoning"}`
+
+	summary := runKiroStreamSSE(t, raw)
+
+	joinedText := strings.Join(summary.textDeltas, "")
+	if strings.Contains(joinedText, "<thinking>") || strings.Contains(joinedText, "never closed reasoning") {
+		t.Fatalf("text_delta leaked thinking content at EOF: %q", joinedText)
+	}
+	if joinedText != "prefix " {
+		t.Fatalf("text_delta content = %q, want only the prefix before the open tag", joinedText)
+	}
+	if !summary.hasMessageStop {
+		t.Fatalf("stream should still emit message_stop on EOF with unclosed thinking")
+	}
+}
+
+// TestStreamKiroToClaudeSSE_ThinkingFollowedByToolUse verifies that thinking
+// content does not interfere with subsequent tool_use blocks. The thinking
+// block must be properly stopped before the tool block starts and tool input
+// must reach the client untouched.
+func TestStreamKiroToClaudeSSE_ThinkingFollowedByToolUse(t *testing.T) {
+	raw := `binary{"content":"<thinking>plan the call</thinking>"}` +
+		`binary{"name":"bash","toolUseId":"tu-x","input":"{\"cmd\":\"ls\"}","stop":true}`
+
+	summary := runKiroStreamSSE(t, raw)
+
+	joinedText := strings.Join(summary.textDeltas, "")
+	if strings.Contains(joinedText, "<thinking>") || strings.Contains(joinedText, "</thinking>") {
+		t.Fatalf("text_delta leaked thinking markup near tool_use: %q", joinedText)
+	}
+
+	if got := strings.Join(summary.thinkingDeltas, ""); got != "plan the call" {
+		t.Fatalf("thinking_delta = %q, want %q", got, "plan the call")
+	}
+
+	sawThinking := false
+	sawTool := false
+	for i, blockType := range summary.blockStarts {
+		if blockType == "thinking" {
+			sawThinking = true
+		}
+		if blockType == "tool_use" {
+			sawTool = true
+			if !sawThinking {
+				t.Fatalf("tool_use block_start at index %d came before thinking block (starts=%v)", i, summary.blockStarts)
+			}
+		}
+	}
+	if !sawThinking || !sawTool {
+		t.Fatalf("expected both thinking and tool_use content blocks, got starts=%v", summary.blockStarts)
+	}
+}
+
+// TestBuildKiroAssistantHistoryMessage_StripsLeakedThinkingFromText verifies
+// that when a previous assistant turn (as serialized by Claude Code) contains
+// a `text` block with leaked `<thinking>...</thinking>` markup, the Kiro
+// history builder hides that markup from the upstream Kiro context. The bug we
+// are guarding against is: leaked reasoning gets re-sent as plain assistant
+// content, accumulating turn after turn until the model loses focus.
+func TestBuildKiroAssistantHistoryMessage_StripsLeakedThinkingFromText(t *testing.T) {
+	msg := gjson.Parse(`{
+		"role": "assistant",
+		"content": [
+			{"type": "text", "text": "Visible answer."},
+			{"type": "text", "text": "<thinking>leaked reasoning</thinking>\n\nMore visible."},
+			{"type": "text", "text": "tail "}
+		]
+	}`)
+
+	out := buildKiroAssistantHistoryMessage(msg, helps.BuildKiroToolNameMaps(nil))
+	arm, ok := out["assistantResponseMessage"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected assistantResponseMessage map, got %T", out["assistantResponseMessage"])
+	}
+	content, ok := arm["content"].(string)
+	if !ok {
+		t.Fatalf("expected string content, got %T", arm["content"])
+	}
+
+	if strings.Contains(content, "leaked reasoning") {
+		t.Fatalf("history content still contains leaked reasoning body: %q", content)
+	}
+	if !strings.Contains(content, "Visible answer.") || !strings.Contains(content, "More visible.") || !strings.Contains(content, "tail") {
+		t.Fatalf("history content lost legitimate user-visible text: %q", content)
+	}
+
+	// If the helper preserves leaked reasoning at all, it must wrap it back
+	// inside the canonical thinking tag (so Kiro treats it as reasoning, not
+	// as visible assistant output). It is also acceptable to drop it entirely.
+	if strings.Contains(content, "<thinking>") {
+		if !strings.Contains(content, "</thinking>") {
+			t.Fatalf("history content has unbalanced thinking markup: %q", content)
+		}
+	}
+}
+
+// TestBuildKiroAssistantHistoryMessage_DropsOrphanCloseTag verifies that an
+// orphan `</thinking>` tag (which can only appear because of an earlier
+// streaming bug) is removed from the visible assistant content rather than
+// being faithfully forwarded to Kiro.
+func TestBuildKiroAssistantHistoryMessage_DropsOrphanCloseTag(t *testing.T) {
+	msg := gjson.Parse(`{
+		"role": "assistant",
+		"content": [
+			{"type": "text", "text": "ought through it.</thinking>\n\nReal answer."}
+		]
+	}`)
+
+	out := buildKiroAssistantHistoryMessage(msg, helps.BuildKiroToolNameMaps(nil))
+	arm := out["assistantResponseMessage"].(map[string]interface{})
+	content := arm["content"].(string)
+
+	if strings.Contains(content, "</thinking>") {
+		t.Fatalf("history still carries orphan close tag: %q", content)
+	}
+	if strings.Contains(content, "ought through it.") {
+		t.Fatalf("history kept orphan reasoning fragment: %q", content)
+	}
+	if !strings.Contains(content, "Real answer.") {
+		t.Fatalf("history dropped legitimate assistant answer: %q", content)
 	}
 }

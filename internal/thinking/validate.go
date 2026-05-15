@@ -58,13 +58,14 @@ func ValidateConfig(config ThinkingConfig, modelInfo *registry.ModelInfo, fromFo
 	// model supports discrete levels. Same-family conversions require strict validation.
 	toCapability := detectModelCapability(modelInfo)
 	toHasLevelSupport := toCapability == CapabilityLevelOnly || toCapability == CapabilityHybrid
-	allowClampUnsupported := toHasLevelSupport && !isSameProviderFamily(fromFormat, toFormat)
+	targetFormat := validationTargetFormat(modelInfo, toFormat)
+	allowClampUnsupported := toHasLevelSupport && !isSameProviderFamily(fromFormat, targetFormat)
 
 	// strictBudget determines whether to enforce strict budget range validation.
 	// This applies when: (1) config comes from request body (not suffix), (2) source format is known,
 	// and (3) source and target are in the same provider family. Cross-family or suffix-based configs
 	// are clamped instead of rejected to improve interoperability.
-	strictBudget := !fromSuffix && fromFormat != "" && isSameProviderFamily(fromFormat, toFormat)
+	strictBudget := !fromSuffix && fromFormat != "" && isSameProviderFamily(fromFormat, targetFormat)
 	budgetDerivedFromLevel := false
 
 	capability := detectModelCapability(modelInfo)
@@ -162,6 +163,17 @@ func ValidateConfig(config ThinkingConfig, modelInfo *registry.ModelInfo, fromFo
 	}
 
 	return &config, nil
+}
+
+func validationTargetFormat(modelInfo *registry.ModelInfo, toFormat string) string {
+	if modelInfo == nil {
+		return toFormat
+	}
+	modelType := strings.ToLower(strings.TrimSpace(modelInfo.Type))
+	if strings.EqualFold(toFormat, "claude") && modelType == "kiro" {
+		return modelType
+	}
+	return toFormat
 }
 
 // convertAutoToMidRange converts ModeAuto to a mid-range value when dynamic is not allowed.

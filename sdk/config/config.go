@@ -24,6 +24,7 @@ type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
 type ClaudeKey = internalconfig.ClaudeKey
 type CodexQueueConfig = internalconfig.CodexQueueConfig
+type KiroConfig = internalconfig.KiroConfig
 type AuthProviderWarmupConfig = internalconfig.AuthProviderWarmupConfig
 type WarmupProviderConfig = internalconfig.WarmupProviderConfig
 type WarmupRuntimeStatus = internalconfig.WarmupRuntimeStatus

@@ -1,8 +1,10 @@
 package helps
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -200,6 +202,15 @@ func initOSInfo() {
 
 // KiroRequestHeaders returns the default headers required by the Kiro API.
 // machineID should be generated via GenerateKiroMachineID.
+//
+// NOTE: Earlier versions sent `Connection: close` here, copied verbatim from
+// the AIClient2API and kiro.rs reference implementations without a documented
+// justification. That forced a fresh TCP+TLS handshake on every request to
+// the AWS CodeWhisperer endpoint, which from typical Asia hosts costs roughly
+// 200–500ms per request (≈3 RTTs to us-east-1). The header has been removed
+// so Go's HTTP transport can reuse pooled keep-alive connections; AWS LBs
+// honor keep-alive by default. Combined with KiroSharedHTTPClient below, this
+// is the single biggest TTFT win available without changing thinking strength.
 func KiroRequestHeaders(machineID string) map[string]string {
 	initOSInfo()
 	return map[string]string{
@@ -210,8 +221,62 @@ func KiroRequestHeaders(machineID string) map[string]string {
 		"x-amzn-kiro-agent-mode":      "vibe",
 		"x-amz-user-agent":            fmt.Sprintf("aws-sdk-js/1.0.34 KiroIDE-%s-%s", KiroVersion, machineID),
 		"user-agent":                  fmt.Sprintf("aws-sdk-js/1.0.34 ua/2.1 os/%s lang/go api/codewhispererstreaming#1.0.34 m/E KiroIDE-%s-%s", osName, KiroVersion, machineID),
-		"Connection":                  "close",
 	}
+}
+
+// kiroSharedClientOnce ensures the singleton Kiro HTTP client and its tuned
+// transport are constructed exactly once for the process lifetime.
+var (
+	kiroSharedClientOnce sync.Once
+	kiroSharedClient     *http.Client
+)
+
+// KiroSharedHTTPClient returns a process-wide *http.Client tuned for the AWS
+// CodeWhisperer streaming endpoint. The client must NOT be used when the
+// caller has a per-request proxy URL or context-injected RoundTripper; those
+// paths still need a fresh transport (see kiro_executor.httpClientFor).
+//
+// Tuning rationale:
+//   - MaxIdleConnsPerHost=8: Kiro typically routes traffic from a small set of
+//     accounts to one AWS region. 8 idle conns per host is enough to absorb
+//     bursty Claude Code multi-turn sessions without holding excessive sockets.
+//   - IdleConnTimeout=5m: AWS LB idle timeout is 60s by default; 5m on the
+//     client side combined with the LB timeout means the client may send a
+//     request on a half-closed conn occasionally and transparently retry.
+//     Lowering further (e.g. 50s) is also reasonable and can be a follow-up.
+//   - TLSHandshakeTimeout=10s: only applies during credential acquisition,
+//     which the project's "no post-connection timeouts" rule explicitly allows.
+//   - ExpectContinueTimeout=1s: matches Go default; benign for our requests.
+//   - ForceAttemptHTTP2=true: matches Go default since 1.17. Enables HTTP/2
+//     multiplexing across concurrent requests on a single TCP connection.
+//   - TLS ClientSessionCache: when keep-alive does miss (long idle, network
+//     blip), session resumption brings the next handshake from ~3 RTTs down
+//     to ~1 RTT, saving ~150-300ms on Asia → us-east-1 paths.
+//   - Proxy=http.ProxyFromEnvironment: matches http.DefaultTransport so the
+//     HTTPS_PROXY / HTTP_PROXY env vars keep working for operators who rely
+//     on shell-level proxies (per-request proxy URLs already get a fresh
+//     transport, see httpClientFor).
+//
+// No timeout is set on the *http.Client itself: streaming responses can take
+// many minutes and the project rule forbids post-handshake deadlines.
+func KiroSharedHTTPClient() *http.Client {
+	kiroSharedClientOnce.Do(func() {
+		transport := &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          64,
+			MaxIdleConnsPerHost:   8,
+			IdleConnTimeout:       5 * time.Minute,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			TLSClientConfig: &tls.Config{
+				ClientSessionCache: tls.NewLRUClientSessionCache(64),
+				MinVersion:         tls.VersionTLS12,
+			},
+		}
+		kiroSharedClient = &http.Client{Transport: transport}
+	})
+	return kiroSharedClient
 }
 
 // KiroPerRequestHeaders returns per-request headers (Authorization + invocation id).
@@ -265,19 +330,28 @@ type KiroStreamEvent struct {
 }
 
 // ParseAwsEventStreamBuffer extracts JSON events from an AWS Event Stream buffer.
-// It returns the parsed events and any remaining unparsed data.
+// It returns the parsed events and any remaining unparsed data as a sub-slice
+// of the input (no copy).
+//
 // This mirrors AIClient2API's parseAwsEventStreamBuffer using brace-counting
-// to handle nested JSON and binary headers.
-func ParseAwsEventStreamBuffer(buffer string) (events []KiroStreamEvent, remaining string) {
+// to handle nested JSON and binary frame headers.
+//
+// The function operates on []byte so that streaming callers can grow a single
+// backing buffer with append() across many body.Read calls without paying the
+// O(N²) `string += string(buf[:n])` cost the previous string-based API forced.
+// The returned `remaining` sub-slice is safe to feed straight back into
+// append(buf[:0], remaining...) on the next round, which the streaming caller
+// in streamKiroToClaudeSSE relies on.
+func ParseAwsEventStreamBuffer(buffer []byte) (events []KiroStreamEvent, remaining []byte) {
 	remaining = buffer
 	searchStart := 0
 
 	for {
-		jsonStart := strings.Index(remaining[searchStart:], "{")
-		if jsonStart < 0 {
+		rel := bytes.IndexByte(remaining[searchStart:], '{')
+		if rel < 0 {
 			break
 		}
-		jsonStart += searchStart
+		jsonStart := searchStart + rel
 
 		// Brace-counting JSON extraction (handles nested objects and strings).
 		braceCount := 0
@@ -313,15 +387,16 @@ func ParseAwsEventStreamBuffer(buffer string) (events []KiroStreamEvent, remaini
 		}
 
 		if jsonEnd < 0 {
-			// Incomplete JSON — keep from jsonStart onward.
+			// Incomplete JSON — keep from jsonStart onward as a sub-slice so
+			// the caller can append the next read into the same backing array.
 			remaining = remaining[jsonStart:]
 			return events, remaining
 		}
 
-		jsonStr := remaining[jsonStart : jsonEnd+1]
+		jsonBytes := remaining[jsonStart : jsonEnd+1]
 
 		var parsed map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		if err := json.Unmarshal(jsonBytes, &parsed); err != nil {
 			// JSON parse failed — skip this "{" and continue.
 			searchStart = jsonStart + 1
 			continue
@@ -334,12 +409,12 @@ func ParseAwsEventStreamBuffer(buffer string) (events []KiroStreamEvent, remaini
 
 		searchStart = jsonEnd + 1
 		if searchStart >= len(remaining) {
-			remaining = ""
+			remaining = remaining[len(remaining):]
 			return events, remaining
 		}
 	}
 
-	// Trim consumed portion.
+	// Trim consumed prefix; returned slice is still backed by the input array.
 	if searchStart > 0 && len(remaining) > 0 {
 		remaining = remaining[searchStart:]
 	}
@@ -462,6 +537,77 @@ func GenerateKiroThinkingPrefix(thinkingType string, budgetTokens int, effort st
 			e = "high"
 		}
 		return fmt.Sprintf("%sadaptive</thinking_mode>%s%s</thinking_effort>", KiroThinkingModeTag, KiroEffortTag, e)
+	default:
+		return ""
+	}
+}
+
+// KiroThinkingEffortPreserve mirrors config.KiroThinkingEffortPreserve so the
+// helps package does not import internal/config. It signals that
+// SelectKiroThinkingPrefix should forward enabled+budget requests verbatim
+// instead of rewriting them into adaptive thinking.
+const KiroThinkingEffortPreserve = "preserve"
+
+// KiroDefaultThinkingEffort is the effort level applied when defaultEffort is
+// unset or invalid. See config.KiroConfig.DefaultThinkingEffort and the data
+// behind the choice (medium == 100% completion, ~3.1s TTFT, retains adaptive
+// reasoning for Opus 4.6 today).
+const KiroDefaultThinkingEffort = "medium"
+
+// SelectKiroThinkingPrefix decides which thinking_mode prefix to inject for a
+// Kiro request, given the client-supplied thinking config and the proxy's
+// configured default effort.
+//
+// The rewrite is necessary because Kiro Opus 4.6 has been measured to drop
+// visible content roughly 25-50% of the time when reasoning under high token
+// budgets (the Claude Code default sends thinking.type=enabled with
+// budget_tokens=31999, which the helper clamps to Kiro's 24576 maximum). When
+// the failure occurs, the upstream still returns 200 but the model spends its
+// budget on reasoning and emits only an empty / 1-character text_delta, which
+// is a severe Claude Code UX regression. Routing those requests through Kiro's
+// adaptive mode at a configurable effort level eliminates the failure mode in
+// observed traffic while preserving meaningful reasoning depth.
+//
+// Behavior matrix:
+//
+//   - thinkingType == "" or "disabled"
+//     → empty prefix (no thinking; matches the (none) suffix UX path).
+//
+//   - thinkingType == "adaptive"
+//     → preserve client effort verbatim. An explicit
+//     `claude-opus-4-6(high)` suffix from the user is always honored even when
+//     defaultEffort is configured otherwise — the per-request opt-in wins.
+//
+//   - thinkingType == "enabled" && defaultEffort == "preserve"
+//     → forward as enabled+budget unchanged. Operators whose Kiro account
+//     does not exhibit the high-budget bug can opt back into the legacy path.
+//
+//   - thinkingType == "enabled" && defaultEffort in {"low","medium","high"}
+//     → rewrite to adaptive at that effort level. Empty / unknown effort
+//     coerces to KiroDefaultThinkingEffort ("medium").
+//
+//   - any other thinkingType
+//     → empty prefix. The upstream defaults to no thinking, matching the
+//     existing GenerateKiroThinkingPrefix behavior for unknown types.
+//
+// The function is deliberately pure (no I/O, no logging) so it can be
+// exercised by unit tests without standing up a config.
+func SelectKiroThinkingPrefix(thinkingType string, budgetTokens int, effort string, defaultEffort string) string {
+	t := strings.ToLower(strings.TrimSpace(thinkingType))
+	switch t {
+	case "", "disabled":
+		return ""
+	case "adaptive":
+		return GenerateKiroThinkingPrefix("adaptive", 0, effort)
+	case "enabled":
+		de := strings.ToLower(strings.TrimSpace(defaultEffort))
+		if de == KiroThinkingEffortPreserve {
+			return GenerateKiroThinkingPrefix("enabled", budgetTokens, "")
+		}
+		if de != "low" && de != "medium" && de != "high" {
+			de = KiroDefaultThinkingEffort
+		}
+		return GenerateKiroThinkingPrefix("adaptive", 0, de)
 	default:
 		return ""
 	}

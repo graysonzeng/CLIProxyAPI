@@ -136,6 +136,9 @@ type Config struct {
 	// AmpCode contains Amp CLI upstream configuration, management restrictions, and model mappings.
 	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
 
+	// Kiro contains Kiro provider runtime configuration. See KiroConfig.
+	Kiro KiroConfig `yaml:"kiro,omitempty" json:"kiro,omitempty"`
+
 	// OAuthExcludedModels defines per-provider global model exclusions applied to OAuth/file-backed auth entries.
 	OAuthExcludedModels map[string][]string `yaml:"oauth-excluded-models,omitempty" json:"oauth-excluded-models,omitempty"`
 
@@ -305,6 +308,61 @@ const (
 	AuthProviderWarmupDefaultPrompt         = "ping"
 	AuthProviderWarmupDefaultMaxConcurrency = 1
 )
+
+// KiroConfig configures Kiro provider runtime behavior.
+//
+// Kiro Opus 4.6 has been measured to drop visible content roughly 25–50% of the
+// time when reasoning under high token budgets (the default Claude Code request
+// uses budget_tokens=31999, which the helper clamps to Kiro's max 24576). When
+// the failure happens, the upstream still returns 200 but emits only a single
+// near-empty text_delta after spending the budget on internal reasoning, which
+// is a severe Claude Code UX regression. Routing those requests through Kiro's
+// `adaptive` mode at a configurable effort level avoids the failure mode while
+// preserving meaningful reasoning depth.
+//
+// All fields are runtime configuration only and are never persisted to auth
+// material.
+type KiroConfig struct {
+	// DefaultThinkingEffort overrides the default thinking strategy when a
+	// client request asks for `thinking.type=enabled` (with or without a
+	// budget). Supported values:
+	//   - "low" / "medium" / "high": rewrite enabled+budget requests into
+	//     adaptive thinking at this effort level.
+	//   - "preserve": forward the original enabled+budget unchanged. Useful
+	//     for operators whose Kiro account does not exhibit the high-budget
+	//     no-output bug.
+	//   - "" (default): treated as "medium" — empirically the most reliable
+	//     option for Opus 4.6 today (100% completion, ~3.1s TTFT, retains
+	//     adaptive reasoning). When Kiro fixes the high-effort regression,
+	//     operators can switch to "high" without a code change.
+	//
+	// Explicit suffix overrides such as "claude-opus-4-6(high)" or
+	// "claude-opus-4-6(none)" always win over this default — the user's
+	// explicit per-request choice is respected verbatim.
+	DefaultThinkingEffort string `yaml:"default-thinking-effort,omitempty" json:"default-thinking-effort,omitempty"`
+}
+
+// Kiro default constants. See KiroConfig.
+const (
+	KiroDefaultThinkingEffort  = "medium"
+	KiroThinkingEffortPreserve = "preserve"
+)
+
+// Normalize fills KiroConfig defaults so callers can rely on stable values.
+// Unknown effort strings are coerced to KiroDefaultThinkingEffort so an
+// invalid YAML entry does not silently disable the rewrite.
+func (c *KiroConfig) Normalize() {
+	if c == nil {
+		return
+	}
+	v := strings.ToLower(strings.TrimSpace(c.DefaultThinkingEffort))
+	switch v {
+	case "low", "medium", "high", KiroThinkingEffortPreserve:
+		c.DefaultThinkingEffort = v
+	default:
+		c.DefaultThinkingEffort = KiroDefaultThinkingEffort
+	}
+}
 
 // codexQueueDefaultGroupBy is the default equivalence-key set used when the
 // user has not configured a custom one. Keep order stable to make group keys
@@ -1022,6 +1080,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Normalize provider warmup defaults.
 	cfg.AuthProviderWarmup.Normalize()
+
+	// Normalize Kiro provider runtime defaults.
+	cfg.Kiro.Normalize()
 
 	// NOTE: Legacy migration persistence is intentionally disabled together with
 	// startup legacy migration to keep startup read-only for config.yaml.

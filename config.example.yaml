@@ -137,6 +137,18 @@ routing:
   #   unknown-quota-policy: "skip"
   #   auto-disable-current: true
 
+# Kiro provider runtime configuration. Currently controls the default thinking
+# strategy for client requests that arrive as `thinking.type=enabled` (the shape
+# Claude Code sends by default). Empirically Kiro Opus 4.6 drops visible content
+# in 25-50% of requests when reasoning under high token budgets, so the proxy
+# rewrites those requests into Kiro `adaptive` thinking at the configured
+# effort level. Explicit per-request suffixes such as `claude-opus-4-6(high)`
+# always win over this default.
+# kiro:
+#   default-thinking-effort: "medium" # one of: low | medium | high | preserve
+#                                     # default: medium (best stability for Opus 4.6 today)
+#                                     # preserve: forward enabled+budget unchanged
+
 # Optional scheduled provider warmup. Disabled by default; enabled providers create real upstream traffic.
 # auth-provider-warmup:
 #   enabled: false

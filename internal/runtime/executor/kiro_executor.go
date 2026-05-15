@@ -35,6 +35,49 @@ func NewKiroExecutor(cfg *config.Config) *KiroExecutor { return &KiroExecutor{cf
 // Identifier returns the provider key.
 func (e *KiroExecutor) Identifier() string { return "kiro" }
 
+// kiroDefaultThinkingEffort returns the configured default thinking effort for
+// rewriting `enabled+budget` requests into Kiro's adaptive thinking mode.
+// Returns "" when the executor has no config attached (e.g. in unit tests),
+// which causes SelectKiroThinkingPrefix to use its built-in medium fallback.
+func (e *KiroExecutor) kiroDefaultThinkingEffort() string {
+	if e == nil || e.cfg == nil {
+		return ""
+	}
+	return e.cfg.Kiro.DefaultThinkingEffort
+}
+
+// httpClientFor selects the HTTP client to use for a Kiro upstream request.
+//
+// Hot path (no per-auth proxy, no global proxy, no context-injected
+// RoundTripper) returns the process-wide shared client from
+// helps.KiroSharedHTTPClient so idle keep-alive connections to the AWS
+// CodeWhisperer endpoint can be reused across requests. With the previous
+// per-call &http.Client{} pattern every request paid a fresh TCP+TLS
+// handshake to us-east-1, costing ~3 RTTs (~200-500ms from typical Asia
+// hosts) on every request — including consecutive requests in the same
+// Claude Code session.
+//
+// When a proxy URL is configured (per-auth or global) or the caller has
+// stashed a custom RoundTripper in the context, the existing
+// NewProxyAwareHTTPClient path is preserved verbatim so users relying on
+// those features see no behavior change.
+func (e *KiroExecutor) httpClientFor(ctx context.Context, auth *cliproxyauth.Auth) *http.Client {
+	proxyURL := ""
+	if auth != nil {
+		proxyURL = strings.TrimSpace(auth.ProxyURL)
+	}
+	if proxyURL == "" && e.cfg != nil {
+		proxyURL = strings.TrimSpace(e.cfg.ProxyURL)
+	}
+	if proxyURL != "" {
+		return helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	}
+	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
+		return helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	}
+	return helps.KiroSharedHTTPClient()
+}
+
 // PrepareRequest injects Kiro credentials into the outgoing HTTP request.
 func (e *KiroExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -59,7 +102,7 @@ func (e *KiroExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := e.httpClientFor(ctx, auth)
 	return httpClient.Do(httpReq)
 }
 
@@ -207,7 +250,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}
 
 	// Build CodeWhisperer request from the Claude-format payload.
-	cwReq, toolNameMaps, err := buildKiroCodeWhispererRequest(body, auth)
+	cwReq, toolNameMaps, err := buildKiroCodeWhispererRequest(body, auth, e.kiroDefaultThinkingEffort())
 	if err != nil {
 		return resp, fmt.Errorf("kiro executor: %w", err)
 	}
@@ -263,7 +306,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 
-	cwReq, toolNameMaps, err := buildKiroCodeWhispererRequest(body, auth)
+	cwReq, toolNameMaps, err := buildKiroCodeWhispererRequest(body, auth, e.kiroDefaultThinkingEffort())
 	if err != nil {
 		return nil, fmt.Errorf("kiro executor: %w", err)
 	}
@@ -523,7 +566,7 @@ func (e *KiroExecutor) doKiroHTTP(ctx context.Context, auth *cliproxyauth.Auth, 
 	}
 	applyKiroHTTPHeaders(httpReq, auth)
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := e.httpClientFor(ctx, auth)
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		return nil, helps.ClassifyKiroNetworkError(err)
@@ -574,7 +617,12 @@ func applyKiroHTTPHeaders(req *http.Request, auth *cliproxyauth.Auth) {
 
 // buildKiroCodeWhispererRequest translates a Claude-format JSON payload
 // into a CodeWhisperer generateAssistantResponse request body.
-func buildKiroCodeWhispererRequest(claudePayload []byte, auth *cliproxyauth.Auth) ([]byte, *helps.KiroToolNameMaps, error) {
+//
+// defaultThinkingEffort controls how `thinking.type=enabled` requests (the
+// shape Claude Code sends by default) are translated for Kiro. See
+// helps.SelectKiroThinkingPrefix for the full behavior matrix; pass "" to
+// fall back to the helper's built-in "medium" default.
+func buildKiroCodeWhispererRequest(claudePayload []byte, auth *cliproxyauth.Auth, defaultThinkingEffort string) ([]byte, *helps.KiroToolNameMaps, error) {
 	conversationID := uuid.New().String()
 	system := gjson.GetBytes(claudePayload, "system")
 	messagesRaw := gjson.GetBytes(claudePayload, "messages")
@@ -596,7 +644,7 @@ func buildKiroCodeWhispererRequest(claudePayload []byte, auth *cliproxyauth.Auth
 			// Claude canonical format places effort under output_config.effort.
 			effort = gjson.GetBytes(claudePayload, "output_config.effort").String()
 		}
-		prefix := helps.GenerateKiroThinkingPrefix(tType, budgetTokens, effort)
+		prefix := helps.SelectKiroThinkingPrefix(tType, budgetTokens, effort, defaultThinkingEffort)
 		if prefix != "" {
 			if systemPrompt != "" {
 				systemPrompt = prefix + "\n" + systemPrompt
@@ -878,7 +926,7 @@ func buildKiroAssistantHistoryMessage(msg gjson.Result, maps *helps.KiroToolName
 		for _, part := range content.Array() {
 			switch part.Get("type").String() {
 			case "text":
-				textParts = append(textParts, part.Get("text").String())
+				textParts = append(textParts, sanitizeKiroVisibleText(part.Get("text").String()))
 			case "thinking":
 				t := part.Get("thinking").String()
 				if t == "" {
@@ -896,7 +944,7 @@ func buildKiroAssistantHistoryMessage(msg gjson.Result, maps *helps.KiroToolName
 		}
 		arm["content"] = strings.Join(textParts, "")
 	} else {
-		arm["content"] = content.String()
+		arm["content"] = sanitizeKiroVisibleText(content.String())
 	}
 
 	if thinkingText != "" {
@@ -1011,7 +1059,7 @@ func deduplicateToolResults(results []interface{}) []interface{} {
 // buildClaudeMessageJSON parses a non-streaming Kiro response and constructs
 // a Claude Messages API JSON response (not SSE). This is what TranslateNonStream expects.
 func buildClaudeMessageJSON(rawResp []byte, toolNameMaps *helps.KiroToolNameMaps, model string) []byte {
-	events, _ := helps.ParseAwsEventStreamBuffer(string(rawResp))
+	events, _ := helps.ParseAwsEventStreamBuffer(rawResp)
 
 	var textContent string
 	type toolCall struct {
@@ -1221,6 +1269,106 @@ func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *he
 
 	hasToolCalls := false
 
+	// inThinking tracks whether we are currently inside an unclosed
+	// `<thinking>...</thinking>` span that started in a previous Kiro `content`
+	// event. Without this state, a tag whose body is split across events would
+	// either close the thinking block prematurely or leak the closing tag (and
+	// reasoning body) into a `text_delta` for the user.
+	inThinking := false
+
+	emitThinkingDelta := func(text string) {
+		if text == "" {
+			return
+		}
+		if thinkingBlockIndex < 0 {
+			idx := nextBlockIndex
+			nextBlockIndex++
+			thinkingBlockIndex = idx
+			emitSSE("content_block_start", map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         idx,
+				"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
+			})
+		}
+		emitSSE("content_block_delta", map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": thinkingBlockIndex,
+			"delta": map[string]interface{}{"type": "thinking_delta", "thinking": text},
+		})
+	}
+
+	emitTextDelta := func(text string) {
+		if text == "" {
+			return
+		}
+		if textBlockIndex < 0 {
+			idx := nextBlockIndex
+			nextBlockIndex++
+			textBlockIndex = idx
+			emitSSE("content_block_start", map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         idx,
+				"content_block": map[string]interface{}{"type": "text", "text": ""},
+			})
+		}
+		emitSSE("content_block_delta", map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": textBlockIndex,
+			"delta": map[string]interface{}{"type": "text_delta", "text": text},
+		})
+	}
+
+	// processContent runs the cross-event thinking state machine over the
+	// payload of one Kiro `content` event. It emits any number of text/thinking
+	// deltas while preserving `inThinking` across calls so that
+	// `<thinking>` / `</thinking>` markers split across multiple events do not
+	// leak reasoning into user-visible text_delta events.
+	processContent := func(text string) {
+		for text != "" {
+			if !inThinking {
+				idx := strings.Index(text, helps.KiroThinkingStartTag)
+				if idx < 0 {
+					emitTextDelta(text)
+					return
+				}
+				if idx > 0 {
+					emitTextDelta(text[:idx])
+				}
+				if textBlockIndex >= 0 {
+					stopBlock(textBlockIndex)
+					textBlockIndex = -1
+				}
+				text = text[idx+len(helps.KiroThinkingStartTag):]
+				if strings.HasPrefix(text, "\r\n") {
+					text = text[2:]
+				} else if strings.HasPrefix(text, "\n") {
+					text = text[1:]
+				}
+				inThinking = true
+				continue
+			}
+			idx := strings.Index(text, helps.KiroThinkingEndTag)
+			if idx < 0 {
+				emitThinkingDelta(text)
+				return
+			}
+			if idx > 0 {
+				emitThinkingDelta(text[:idx])
+			}
+			if thinkingBlockIndex >= 0 {
+				stopBlock(thinkingBlockIndex)
+				thinkingBlockIndex = -1
+			}
+			text = text[idx+len(helps.KiroThinkingEndTag):]
+			if strings.HasPrefix(text, "\n\n") {
+				text = text[2:]
+			} else if strings.HasPrefix(text, "\n") {
+				text = text[1:]
+			}
+			inThinking = false
+		}
+	}
+
 	// processEvent handles a single parsed Kiro stream event.
 	processEvent := func(evt helps.KiroStreamEvent) {
 		switch evt.Type {
@@ -1229,61 +1377,7 @@ func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *he
 				return
 			}
 			lastContent = evt.Content
-
-			// Check for thinking tags in content.
-			if strings.Contains(evt.Content, helps.KiroThinkingStartTag) {
-				thinkingText, afterText := extractThinkingFromText(evt.Content)
-				if thinkingText != "" && thinkingBlockIndex < 0 {
-					idx := nextBlockIndex
-					nextBlockIndex++
-					thinkingBlockIndex = idx
-					emitSSE("content_block_start", map[string]interface{}{
-						"type":          "content_block_start",
-						"index":         idx,
-						"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
-					})
-					emitSSE("content_block_delta", map[string]interface{}{
-						"type":  "content_block_delta",
-						"index": idx,
-						"delta": map[string]interface{}{"type": "thinking_delta", "thinking": thinkingText},
-					})
-					stopBlock(idx)
-				}
-				if afterText != "" {
-					if textBlockIndex < 0 {
-						idx := nextBlockIndex
-						nextBlockIndex++
-						textBlockIndex = idx
-						emitSSE("content_block_start", map[string]interface{}{
-							"type":          "content_block_start",
-							"index":         idx,
-							"content_block": map[string]interface{}{"type": "text", "text": ""},
-						})
-					}
-					emitSSE("content_block_delta", map[string]interface{}{
-						"type":  "content_block_delta",
-						"index": textBlockIndex,
-						"delta": map[string]interface{}{"type": "text_delta", "text": afterText},
-					})
-				}
-			} else {
-				// Plain text content.
-				if textBlockIndex < 0 {
-					idx := nextBlockIndex
-					nextBlockIndex++
-					textBlockIndex = idx
-					emitSSE("content_block_start", map[string]interface{}{
-						"type":          "content_block_start",
-						"index":         idx,
-						"content_block": map[string]interface{}{"type": "text", "text": ""},
-					})
-				}
-				emitSSE("content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": textBlockIndex,
-					"delta": map[string]interface{}{"type": "text_delta", "text": evt.Content},
-				})
-			}
+			processContent(evt.Content)
 
 		case "toolUse":
 			hasToolCalls = true
@@ -1372,18 +1466,35 @@ func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *he
 	}
 
 	// Incrementally read from the response body and parse events.
+	//
+	// remaining is grown via append() so its backing array is reused across
+	// reads (geometric growth → O(N) total allocation). The previous
+	// `remaining += string(readBuf[:n])` pattern allocated a fresh string on
+	// every Read, producing O(N²) bytes copied for long streams (e.g. ~1MB
+	// of allocs for a 100KB response delivered in 32KB chunks). For long
+	// Kiro Opus 4.6 multi-turn responses this both increased GC pressure and
+	// occasionally introduced perceptible delta jitter.
 	const readBufSize = 32 * 1024
 	readBuf := make([]byte, readBufSize)
-	var remaining string
+	remaining := make([]byte, 0, readBufSize)
 	for {
 		if errCtx := contextErr(ctx); errCtx != nil {
 			return result, errCtx
 		}
 		n, readErr := body.Read(readBuf)
 		if n > 0 {
-			remaining += string(readBuf[:n])
+			remaining = append(remaining, readBuf[:n]...)
 			var events []helps.KiroStreamEvent
 			events, remaining = helps.ParseAwsEventStreamBuffer(remaining)
+			// ParseAwsEventStreamBuffer returns a sub-slice of `remaining`.
+			// Re-anchor it to the head of a fresh backing buffer when it has
+			// drifted far into the original array, so append() in the next
+			// iteration can keep growing without unbounded offsets.
+			if cap(remaining) > readBufSize && len(remaining) < cap(remaining)/4 {
+				compact := make([]byte, len(remaining), readBufSize)
+				copy(compact, remaining)
+				remaining = compact
+			}
 			processEvents(events)
 		}
 		if readErr != nil {
@@ -1398,12 +1509,16 @@ func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *he
 		}
 	}
 	// Final parse attempt on any remaining buffer data.
-	if remaining != "" {
+	if len(remaining) > 0 {
 		var finalEvents []helps.KiroStreamEvent
 		finalEvents, remaining = helps.ParseAwsEventStreamBuffer(remaining)
 		processEvents(finalEvents)
 		if hasKiroJSONResidue(remaining) {
-			return result, newKiroStreamError(helps.KiroErrStreamMalformed, "stream ended with incomplete JSON event", nil)
+			if result.payloadStarted {
+				log.Warn("kiro executor: ignoring incomplete trailing JSON event after payload started")
+			} else {
+				return result, newKiroStreamError(helps.KiroErrStreamMalformed, "stream ended with incomplete JSON event", nil)
+			}
 		}
 	}
 	if result.eventCount == 0 || !result.payloadStarted {
@@ -1454,8 +1569,71 @@ func newKiroStreamError(class helps.KiroErrorClass, message string, cause error)
 	return &helps.KiroError{Class: class, Body: message}
 }
 
-func hasKiroJSONResidue(remaining string) bool {
-	return strings.Contains(remaining, "{")
+func hasKiroJSONResidue(remaining []byte) bool {
+	return bytes.IndexByte(remaining, '{') >= 0
+}
+
+// sanitizeKiroVisibleText removes any `<thinking>...</thinking>` markup that
+// previously leaked into a visible assistant text block. Older Kiro streaming
+// behaviour (see streamKiroToClaudeSSE prior to the cross-event state machine)
+// could emit reasoning fragments and orphan close tags as user-visible
+// text_delta events when Kiro split the surrounding tags across multiple
+// upstream events. Claude Code persists those fragments in the assistant turn,
+// and without this guard they would be replayed as plain assistant content on
+// every subsequent turn, polluting Kiro's context window.
+//
+// The function is intentionally conservative:
+//   - Balanced `<thinking>...</thinking>` segments are dropped entirely.
+//   - An open `<thinking>` without a matching close drops everything from the
+//     tag onward.
+//   - An orphan `</thinking>` drops everything before the tag (the leaked
+//     reasoning fragment) and keeps the suffix.
+//
+// Dropped reasoning is not re-promoted into a thinking block: we cannot prove
+// the fragment is faithful to the original model output, and re-promotion would
+// keep the poisoned text in the conversation indefinitely.
+func sanitizeKiroVisibleText(text string) string {
+	if !strings.Contains(text, helps.KiroThinkingStartTag) && !strings.Contains(text, helps.KiroThinkingEndTag) {
+		return text
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+	inThinking := false
+	for text != "" {
+		if !inThinking {
+			startIdx := strings.Index(text, helps.KiroThinkingStartTag)
+			stopIdx := strings.Index(text, helps.KiroThinkingEndTag)
+			if startIdx < 0 && stopIdx < 0 {
+				b.WriteString(text)
+				return b.String()
+			}
+			if startIdx >= 0 && (stopIdx < 0 || startIdx < stopIdx) {
+				b.WriteString(text[:startIdx])
+				text = text[startIdx+len(helps.KiroThinkingStartTag):]
+				inThinking = true
+				continue
+			}
+			text = text[stopIdx+len(helps.KiroThinkingEndTag):]
+			if strings.HasPrefix(text, "\n\n") {
+				text = text[2:]
+			} else if strings.HasPrefix(text, "\n") {
+				text = text[1:]
+			}
+			continue
+		}
+		endIdx := strings.Index(text, helps.KiroThinkingEndTag)
+		if endIdx < 0 {
+			return b.String()
+		}
+		text = text[endIdx+len(helps.KiroThinkingEndTag):]
+		if strings.HasPrefix(text, "\n\n") {
+			text = text[2:]
+		} else if strings.HasPrefix(text, "\n") {
+			text = text[1:]
+		}
+		inThinking = false
+	}
+	return b.String()
 }
 
 func extractThinkingFromText(text string) (thinking string, remaining string) {
