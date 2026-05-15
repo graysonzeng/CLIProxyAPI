@@ -254,7 +254,7 @@ func TestStreamKiroToClaudeSSE_TextOnly(t *testing.T) {
 	raw := `binary{"content": "Hello"}binary{"content": " world"}`
 	reader := strings.NewReader(raw)
 	var lines [][]byte
-	streamKiroToClaudeSSE(nil, reader, nil, "claude-sonnet-4-5", func(line []byte) {
+	_, _ = streamKiroToClaudeSSE(nil, reader, nil, "claude-sonnet-4-5", func(line []byte) {
 		lines = append(lines, append([]byte(nil), line...))
 	})
 
@@ -296,7 +296,7 @@ func TestStreamKiroToClaudeSSE_TranslatesToOpenAIChunks(t *testing.T) {
 	var content strings.Builder
 	var chunkCount int
 
-	streamKiroToClaudeSSE(nil, reader, nil, "claude-sonnet-4-5", func(line []byte) {
+	_, _ = streamKiroToClaudeSSE(nil, reader, nil, "claude-sonnet-4-5", func(line []byte) {
 		for _, dataLine := range claudeSSEDataLines(line) {
 			chunks := sdktranslator.TranslateStream(
 				context.Background(),
@@ -327,7 +327,7 @@ func TestStreamKiroToClaudeSSE_WithToolUse(t *testing.T) {
 	raw := `{"content": "text"}binary{"name": "bash", "toolUseId": "tu-1", "stop": false}binary{"input": "{\"cmd\":\"ls\"}"}binary{"stop": true}`
 	reader := strings.NewReader(raw)
 	var lines [][]byte
-	streamKiroToClaudeSSE(nil, reader, nil, "claude-sonnet-4-5", func(line []byte) {
+	_, _ = streamKiroToClaudeSSE(nil, reader, nil, "claude-sonnet-4-5", func(line []byte) {
 		lines = append(lines, append([]byte(nil), line...))
 	})
 
@@ -372,6 +372,89 @@ func (r *chunkedReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+type errorAfterChunksReader struct {
+	chunks []string
+	idx    int
+	err    error
+}
+
+func (r *errorAfterChunksReader) Read(p []byte) (int, error) {
+	if r.idx >= len(r.chunks) {
+		return 0, r.err
+	}
+	n := copy(p, r.chunks[r.idx])
+	r.idx++
+	return n, nil
+}
+
+func TestStreamKiroToClaudeSSE_EmptyStreamLeavesConductorEmptyStreamPath(t *testing.T) {
+	result, err := streamKiroToClaudeSSE(context.Background(), strings.NewReader(""), nil, "claude-sonnet-4-5", func([]byte) {
+		t.Fatal("empty stream should not emit payload")
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v, want nil for conductor empty_stream path", err)
+	}
+	if result.eventCount != 0 || result.payloadStarted {
+		t.Fatalf("result = %+v, want zero events and no payload", result)
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ReadErrorBeforePayloadReturnsError(t *testing.T) {
+	readErr := errors.New("upstream reset")
+	result, err := streamKiroToClaudeSSE(context.Background(), &errorAfterChunksReader{err: readErr}, nil, "claude-sonnet-4-5", func([]byte) {
+		t.Fatal("read error before payload should not emit payload")
+	})
+	if err == nil {
+		t.Fatal("streamKiroToClaudeSSE error = nil, want read error")
+	}
+	var kiroErr *helps.KiroError
+	if !errors.As(err, &kiroErr) || kiroErr.Classification() != helps.KiroErrStreamRead {
+		t.Fatalf("error = %T %v, want KiroErrStreamRead", err, err)
+	}
+	if result.payloadStarted {
+		t.Fatalf("payloadStarted = true, want false")
+	}
+}
+
+func TestStreamKiroToClaudeSSE_MalformedBeforePayloadReturnsError(t *testing.T) {
+	var lines [][]byte
+	result, err := streamKiroToClaudeSSE(context.Background(), strings.NewReader(`binary{"content":"oops"`), nil, "claude-sonnet-4-5", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err == nil {
+		t.Fatal("streamKiroToClaudeSSE error = nil, want malformed error")
+	}
+	var kiroErr *helps.KiroError
+	if !errors.As(err, &kiroErr) || kiroErr.Classification() != helps.KiroErrStreamMalformed {
+		t.Fatalf("error = %T %v, want KiroErrStreamMalformed", err, err)
+	}
+	if len(lines) != 0 || result.payloadStarted {
+		t.Fatalf("lines=%d result=%+v, want no payload before malformed error", len(lines), result)
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ReadErrorAfterPayloadDoesNotEmitStop(t *testing.T) {
+	readErr := errors.New("connection reset")
+	reader := &errorAfterChunksReader{chunks: []string{`binary{"content": "Hello"}`}, err: readErr}
+	var lines []string
+	result, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-sonnet-4-5", func(line []byte) {
+		lines = append(lines, string(line))
+	})
+	if err == nil {
+		t.Fatal("streamKiroToClaudeSSE error = nil, want read error")
+	}
+	if !result.payloadStarted {
+		t.Fatalf("payloadStarted = false, want true")
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "message_start") || !strings.Contains(joined, "text_delta") {
+		t.Fatalf("lines missing start/content events: %s", joined)
+	}
+	if strings.Contains(joined, "message_stop") || strings.Contains(joined, "message_delta") {
+		t.Fatalf("stream emitted success terminal events after read error: %s", joined)
+	}
+}
+
 func TestStreamKiroToClaudeSSE_Incremental(t *testing.T) {
 	// Deliver two content events in separate chunks to verify incremental emission.
 	reader := &chunkedReader{
@@ -385,7 +468,7 @@ func TestStreamKiroToClaudeSSE_Incremental(t *testing.T) {
 	var emittedAfterChunk1 int
 	origIdx := &reader.idx
 
-	streamKiroToClaudeSSE(nil, reader, nil, "claude-sonnet-4-5", func(line []byte) {
+	_, _ = streamKiroToClaudeSSE(nil, reader, nil, "claude-sonnet-4-5", func(line []byte) {
 		emitCount++
 		// After the reader has consumed only the first chunk (idx==1),
 		// we should already have received SSE lines (message_start + first content events).
@@ -397,8 +480,8 @@ func TestStreamKiroToClaudeSSE_Incremental(t *testing.T) {
 	if emitCount == 0 {
 		t.Fatal("expected SSE lines to be emitted")
 	}
-	// message_start is emitted before any read, so at minimum 1 line should
-	// have been emitted before all chunks are consumed.
+	// message_start is emitted after the first valid event, so at minimum 1 line
+	// should have been emitted before all chunks are consumed.
 	if emittedAfterChunk1 == 0 {
 		t.Error("expected SSE lines to be emitted incrementally before all data is read")
 	}
@@ -519,6 +602,80 @@ func TestKiroExecutorExecuteStreamPublishesSuccessUsage(t *testing.T) {
 	}
 	if record.Provider != "kiro" || record.Model != "claude-sonnet-4-5" {
 		t.Fatalf("usage record provider/model = %s/%s, want kiro/claude-sonnet-4-5", record.Provider, record.Model)
+	}
+}
+
+func TestKiroExecutorExecuteStreamPublishesFailureOnMalformedStream(t *testing.T) {
+	capture := registerKiroUsageCapture()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer at-stream-fail" {
+			t.Fatalf("Authorization = %q, want Bearer at-stream-fail", got)
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte(`binary{"content":"oops"`))
+	}))
+	defer server.Close()
+
+	origTemplate := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL
+	defer func() { helps.KiroBaseURLTemplate = origTemplate }()
+
+	authID := "kiro-usage-stream-fail"
+	executor := NewKiroExecutor(nil)
+	auth := &cliproxyauth.Auth{
+		ID:       authID,
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken": "at-stream-fail",
+			"region":      "us-east-1",
+		},
+	}
+	payload := []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var gotErr error
+	var sawPayload bool
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			gotErr = chunk.Err
+		}
+		if len(chunk.Payload) > 0 {
+			sawPayload = true
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected stream chunk error")
+	}
+	if sawPayload {
+		t.Fatal("malformed stream before first event should not emit payload")
+	}
+
+	record := waitForKiroUsageRecord(t, capture, authID)
+	if !record.Failed {
+		t.Fatalf("usage record Failed = false, want true: %+v", record)
+	}
+}
+
+func TestKiroExecutorCountTokensKeepsUnsupported(t *testing.T) {
+	executor := NewKiroExecutor(nil)
+	_, err := executor.CountTokens(context.Background(), nil, cliproxyexecutor.Request{Model: "claude-sonnet-4-5"}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("CountTokens error = nil, want unsupported")
+	}
+	status, ok := err.(interface{ StatusCode() int })
+	if !ok || status.StatusCode() != http.StatusNotImplemented {
+		t.Fatalf("CountTokens error = %T %v, want 501 status", err, err)
+	}
+	if !strings.Contains(err.Error(), "cpa_kiro_count_tokens_unsupported") {
+		t.Fatalf("CountTokens error = %q, want cpa unsupported marker", err.Error())
 	}
 }
 
@@ -688,7 +845,7 @@ func TestStreamKiroToClaudeSSE_SameToolUseID_MultiEvent(t *testing.T) {
 		`binary{"name": "get_weather", "toolUseId": "tu-dup", "input": "\"NYC\"}", "stop": true}`
 	reader := strings.NewReader(raw)
 	var lines []string
-	streamKiroToClaudeSSE(nil, reader, nil, "claude-sonnet-4-5", func(line []byte) {
+	_, _ = streamKiroToClaudeSSE(nil, reader, nil, "claude-sonnet-4-5", func(line []byte) {
 		lines = append(lines, string(line))
 	})
 
@@ -785,7 +942,7 @@ func TestStreamKiroToClaudeSSE_MultiTool_DifferentIDs(t *testing.T) {
 		`binary{"name": "write_file", "toolUseId": "tu-b", "input": "{\"p\":\"/b\"}", "stop": true}`
 	reader := strings.NewReader(raw)
 	var lines []string
-	streamKiroToClaudeSSE(nil, reader, nil, "claude-sonnet-4-5", func(line []byte) {
+	_, _ = streamKiroToClaudeSSE(nil, reader, nil, "claude-sonnet-4-5", func(line []byte) {
 		lines = append(lines, string(line))
 	})
 

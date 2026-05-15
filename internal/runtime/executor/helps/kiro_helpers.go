@@ -516,6 +516,13 @@ const (
 	// KiroErrUnknown is used when the status code does not match any known
 	// bucket and a network classification does not apply.
 	KiroErrUnknown KiroErrorClass = "unknown"
+	// KiroErrStreamRead indicates a streaming body read failed after the upstream
+	// response was established. The conductor may fail over when no payload has
+	// been sent yet.
+	KiroErrStreamRead KiroErrorClass = "stream_read"
+	// KiroErrStreamMalformed indicates the stream ended with an incomplete Kiro
+	// JSON event buffered by the brace-count parser.
+	KiroErrStreamMalformed KiroErrorClass = "stream_malformed"
 )
 
 // KiroError is a classified Kiro error returned by Execute / ExecuteStream.

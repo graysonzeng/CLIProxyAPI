@@ -65,7 +65,7 @@ func (e *KiroExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 
 // CountTokens is not natively supported by Kiro; returns unsupported error.
 func (e *KiroExecutor) CountTokens(_ context.Context, _ *cliproxyauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, statusErr{code: http.StatusNotImplemented, msg: "kiro: count tokens not supported"}
+	return cliproxyexecutor.Response{}, statusErr{code: http.StatusNotImplemented, msg: "cpa_kiro_count_tokens_unsupported: kiro does not support precise token counting"}
 }
 
 // Refresh handles token refresh for both social and builder-id auth methods.
@@ -282,9 +282,11 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			}
 		}()
 
+		var streamResult kiroStreamResult
+		var streamErr error
 		if from == to {
 			// Claude→Claude: forward SSE lines directly.
-			streamKiroToClaudeSSE(ctx, httpResp.Body, toolNameMaps, baseModel, func(line []byte) {
+			streamResult, streamErr = streamKiroToClaudeSSE(ctx, httpResp.Body, toolNameMaps, baseModel, func(line []byte) {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: append(line, '\n')}:
 				case <-ctx.Done():
@@ -293,7 +295,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		} else {
 			// Other formats: translate each SSE line.
 			var param any
-			streamKiroToClaudeSSE(ctx, httpResp.Body, toolNameMaps, baseModel, func(line []byte) {
+			streamResult, streamErr = streamKiroToClaudeSSE(ctx, httpResp.Body, toolNameMaps, baseModel, func(line []byte) {
 				for _, dataLine := range claudeSSEDataLines(line) {
 					chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, dataLine, &param)
 					for i := range chunks {
@@ -305,7 +307,17 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				}
 			})
 		}
-		reporter.EnsurePublished(ctx)
+		if streamErr != nil {
+			reporter.PublishFailure(ctx, streamErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		if streamResult.payloadStarted {
+			reporter.EnsurePublished(ctx)
+		}
 	}()
 
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -1122,7 +1134,7 @@ func buildClaudeMessageJSON(rawResp []byte, toolNameMaps *helps.KiroToolNameMaps
 
 func buildClaudeMessageSSE(rawResp []byte, toolNameMaps *helps.KiroToolNameMaps, model string) []byte {
 	var buf bytes.Buffer
-	streamKiroToClaudeSSE(context.Background(), bytes.NewReader(rawResp), toolNameMaps, model, func(line []byte) {
+	_, _ = streamKiroToClaudeSSE(context.Background(), bytes.NewReader(rawResp), toolNameMaps, model, func(line []byte) {
 		buf.Write(line)
 		if !bytes.HasSuffix(line, []byte("\n\n")) {
 			buf.WriteByte('\n')
@@ -1145,11 +1157,17 @@ func claudeSSEDataLines(raw []byte) [][]byte {
 
 // --- Streaming response builder ---
 
+type kiroStreamResult struct {
+	eventCount     int
+	payloadStarted bool
+}
+
 // streamKiroToClaudeSSE incrementally reads a Kiro streaming response, parsing
 // AWS Event Stream chunks as they arrive and converting each event to Claude SSE
 // format. The emit callback is called for each SSE line as soon as it is ready,
 // enabling true incremental streaming to the client.
-func streamKiroToClaudeSSE(_ context.Context, body io.Reader, toolNameMaps *helps.KiroToolNameMaps, model string, emit func([]byte)) {
+func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *helps.KiroToolNameMaps, model string, emit func([]byte)) (kiroStreamResult, error) {
+	var result kiroStreamResult
 	msgID := "msg_" + uuid.New().String()
 	nextBlockIndex := 0
 	stoppedBlocks := make(map[int]bool)
@@ -1172,18 +1190,23 @@ func streamKiroToClaudeSSE(_ context.Context, body io.Reader, toolNameMaps *help
 		emit([]byte(line))
 	}
 
-	// message_start
-	emitSSE("message_start", map[string]interface{}{
-		"type": "message_start",
-		"message": map[string]interface{}{
-			"id":      msgID,
-			"type":    "message",
-			"role":    "assistant",
-			"content": []interface{}{},
-			"model":   model,
-			"usage":   map[string]interface{}{"input_tokens": 0, "output_tokens": 0},
-		},
-	})
+	emitMessageStart := func() {
+		if result.payloadStarted {
+			return
+		}
+		result.payloadStarted = true
+		emitSSE("message_start", map[string]interface{}{
+			"type": "message_start",
+			"message": map[string]interface{}{
+				"id":      msgID,
+				"type":    "message",
+				"role":    "assistant",
+				"content": []interface{}{},
+				"model":   model,
+				"usage":   map[string]interface{}{"input_tokens": 0, "output_tokens": 0},
+			},
+		})
+	}
 
 	stopBlock := func(index int) {
 		if index < 0 || stoppedBlocks[index] {
@@ -1340,33 +1363,51 @@ func streamKiroToClaudeSSE(_ context.Context, body io.Reader, toolNameMaps *help
 		}
 	}
 
+	processEvents := func(events []helps.KiroStreamEvent) {
+		for _, evt := range events {
+			result.eventCount++
+			emitMessageStart()
+			processEvent(evt)
+		}
+	}
+
 	// Incrementally read from the response body and parse events.
 	const readBufSize = 32 * 1024
 	readBuf := make([]byte, readBufSize)
 	var remaining string
 	for {
+		if errCtx := contextErr(ctx); errCtx != nil {
+			return result, errCtx
+		}
 		n, readErr := body.Read(readBuf)
 		if n > 0 {
 			remaining += string(readBuf[:n])
 			var events []helps.KiroStreamEvent
 			events, remaining = helps.ParseAwsEventStreamBuffer(remaining)
-			for _, evt := range events {
-				processEvent(evt)
-			}
+			processEvents(events)
 		}
 		if readErr != nil {
-			if readErr != io.EOF {
-				log.Warnf("kiro executor: error reading stream: %v", readErr)
+			if readErr == io.EOF {
+				break
 			}
-			break
+			if errCtx := contextErr(ctx); errCtx != nil {
+				return result, errCtx
+			}
+			log.Warnf("kiro executor: error reading stream: %v", readErr)
+			return result, newKiroStreamError(helps.KiroErrStreamRead, "stream read failed", readErr)
 		}
 	}
 	// Final parse attempt on any remaining buffer data.
 	if remaining != "" {
-		finalEvents, _ := helps.ParseAwsEventStreamBuffer(remaining)
-		for _, evt := range finalEvents {
-			processEvent(evt)
+		var finalEvents []helps.KiroStreamEvent
+		finalEvents, remaining = helps.ParseAwsEventStreamBuffer(remaining)
+		processEvents(finalEvents)
+		if hasKiroJSONResidue(remaining) {
+			return result, newKiroStreamError(helps.KiroErrStreamMalformed, "stream ended with incomplete JSON event", nil)
 		}
+	}
+	if result.eventCount == 0 || !result.payloadStarted {
+		return result, nil
 	}
 
 	// Stop any remaining open blocks.
@@ -1396,6 +1437,25 @@ func streamKiroToClaudeSSE(_ context.Context, body io.Reader, toolNameMaps *help
 	emitSSE("message_stop", map[string]interface{}{
 		"type": "message_stop",
 	})
+	return result, nil
+}
+
+func contextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
+}
+
+func newKiroStreamError(class helps.KiroErrorClass, message string, cause error) error {
+	if cause != nil {
+		message = fmt.Sprintf("%s: %v", message, cause)
+	}
+	return &helps.KiroError{Class: class, Body: message}
+}
+
+func hasKiroJSONResidue(remaining string) bool {
+	return strings.Contains(remaining, "{")
 }
 
 func extractThinkingFromText(text string) (thinking string, remaining string) {
