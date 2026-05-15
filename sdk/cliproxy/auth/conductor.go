@@ -1366,8 +1366,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			return cliproxyexecutor.Response{}, errPick
 		}
 
-		entry := logEntryWithRequestID(ctx)
-		debugLogAuthSelection(entry, auth, provider, req.Model)
+		synthetic := isSyntheticRequestMetadata(opts.Metadata)
+		if !synthetic {
+			entry := logEntryWithRequestID(ctx)
+			debugLogAuthSelection(entry, auth, provider, req.Model)
+		}
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
@@ -1390,7 +1393,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Synthetic: isSyntheticRequestMetadata(opts.Metadata)}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Synthetic: synthetic}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -1455,8 +1458,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			return cliproxyexecutor.Response{}, errPick
 		}
 
-		entry := logEntryWithRequestID(ctx)
-		debugLogAuthSelection(entry, auth, provider, req.Model)
+		synthetic := isSyntheticRequestMetadata(opts.Metadata)
+		if !synthetic {
+			entry := logEntryWithRequestID(ctx)
+			debugLogAuthSelection(entry, auth, provider, req.Model)
+		}
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
@@ -1479,7 +1485,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Synthetic: isSyntheticRequestMetadata(opts.Metadata)}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Synthetic: synthetic}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -1544,8 +1550,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			return nil, errPick
 		}
 
-		entry := logEntryWithRequestID(ctx)
-		debugLogAuthSelection(entry, auth, provider, req.Model)
+		synthetic := isSyntheticRequestMetadata(opts.Metadata)
+		if !synthetic {
+			entry := logEntryWithRequestID(ctx)
+			debugLogAuthSelection(entry, auth, provider, req.Model)
+		}
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
@@ -2201,7 +2210,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			m.mu.Unlock()
 			log.WithFields(log.Fields{
 				"provider": result.Provider,
-				"auth_id":  result.AuthID,
 				"model":    result.Model,
 				"success":  result.Success,
 			}).Debug("synthetic result skipped auth state")

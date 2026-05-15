@@ -39,6 +39,22 @@ func mustEnabledQueueConfig() internalconfig.CodexQueueConfig {
 	return cfg
 }
 
+func knownQuota(percent float64) CodexQuotaSnapshot {
+	return CodexQuotaSnapshot{
+		PrimaryWindow: QuotaWindowSnapshot{PercentRemaining: percent, WindowMinutes: 300},
+		Status:        CodexQuotaStatusKnown,
+	}
+}
+
+func registerQueueTestAuths(t *testing.T, manager *Manager, auths ...*Auth) {
+	t.Helper()
+	for _, auth := range auths {
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register %s: %v", auth.ID, err)
+		}
+	}
+}
+
 func TestCoordinatorPromotesAfterIdleAndLowQuota(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	coordinator := manager.EnsureCodexQueueCoordinator()
@@ -117,6 +133,143 @@ func TestCoordinatorPromotesAfterIdleAndLowQuota(t *testing.T) {
 	}
 }
 
+func TestCoordinatorUsesSingleGlobalGroupAcrossDifferentAuthAttributes(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	coordinator := manager.EnsureCodexQueueCoordinator()
+
+	a1 := newQueueTestAuth("auth-1", "team-a")
+	a2 := newQueueTestAuth("auth-2", "team-b")
+	a2.Attributes["plan_type"] = "plus"
+	a3 := newQueueTestAuth("auth-3", "team-c")
+	a3.Attributes["websockets"] = "true"
+	registerQueueTestAuths(t, manager, a1, a2, a3)
+
+	cfg := mustEnabledQueueConfig()
+	coordinator.ApplyConfig(cfg)
+	coordinator.SetProvider(CodexQueueQuotaProviderFunc(func(ctx context.Context, auth *Auth) (CodexQuotaSnapshot, error) {
+		return knownQuota(80), nil
+	}))
+	coordinator.Reconcile(context.Background())
+
+	groups := coordinator.Groups()
+	if len(groups) != 1 {
+		t.Fatalf("expected one global queue group, got %d: %+v", len(groups), groups)
+	}
+	if groups[0].GroupKey != codexQueueGlobalGroupKey {
+		t.Fatalf("group key = %q, want %q", groups[0].GroupKey, codexQueueGlobalGroupKey)
+	}
+	if len(groups[0].Members) != 3 {
+		t.Fatalf("global group member count = %d, want 3", len(groups[0].Members))
+	}
+	active := groups[0].ActiveAuthID
+	if active == "" {
+		t.Fatalf("expected elected active auth")
+	}
+	for _, member := range groups[0].Members {
+		blocked := coordinator.IsQueueRoutingBlocked(member.AuthID)
+		if member.AuthID == active {
+			if blocked {
+				t.Fatalf("active auth %q must be routable", member.AuthID)
+			}
+			continue
+		}
+		if !blocked {
+			t.Fatalf("standby auth %q must be routing-blocked in global queue mode", member.AuthID)
+		}
+	}
+}
+
+func TestCoordinatorGlobalQueueExhaustsAllAccountsWithoutFallback(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	coordinator := manager.EnsureCodexQueueCoordinator()
+	coordinator.activeRefreshEvery = 0
+	coordinator.standbyRefreshEvery = 0
+
+	now := time.Date(2026, 5, 15, 14, 0, 0, 0, time.UTC)
+	coordinator.now = func() time.Time { return now }
+
+	registerQueueTestAuths(t, manager,
+		newQueueTestAuth("auth-1", "team-a"),
+		newQueueTestAuth("auth-2", "team-b"),
+		newQueueTestAuth("auth-3", "team-c"),
+	)
+
+	cfg := mustEnabledQueueConfig()
+	cfg.IdleWindow = "1m"
+	cfg.Normalize()
+	coordinator.ApplyConfig(cfg)
+
+	quotas := map[string]float64{
+		"auth-1": 80,
+		"auth-2": 80,
+		"auth-3": 80,
+	}
+	coordinator.SetProvider(CodexQueueQuotaProviderFunc(func(ctx context.Context, auth *Auth) (CodexQuotaSnapshot, error) {
+		return knownQuota(quotas[auth.ID]), nil
+	}))
+
+	coordinator.Reconcile(context.Background())
+	groups := coordinator.Groups()
+	if len(groups) != 1 {
+		t.Fatalf("expected one global group, got %d", len(groups))
+	}
+	if groups[0].ActiveAuthID != "auth-1" {
+		t.Fatalf("initial active = %q, want auth-1", groups[0].ActiveAuthID)
+	}
+
+	quotas["auth-1"] = 2
+	now = now.Add(2 * time.Minute)
+	coordinator.Reconcile(context.Background())
+	if active := coordinator.Groups()[0].ActiveAuthID; active != "auth-2" {
+		t.Fatalf("after auth-1 exhaust active = %q, want auth-2", active)
+	}
+	if !coordinator.IsQueueManagedDisabled("auth-1") {
+		t.Fatalf("auth-1 should be queue-managed disabled after switch")
+	}
+
+	quotas["auth-2"] = 2
+	now = now.Add(2 * time.Minute)
+	coordinator.Reconcile(context.Background())
+	if active := coordinator.Groups()[0].ActiveAuthID; active != "auth-3" {
+		t.Fatalf("after auth-2 exhaust active = %q, want auth-3", active)
+	}
+	if !coordinator.IsQueueManagedDisabled("auth-2") {
+		t.Fatalf("auth-2 should be queue-managed disabled after switch")
+	}
+
+	quotas["auth-3"] = 2
+	now = now.Add(2 * time.Minute)
+	coordinator.Reconcile(context.Background())
+	groups = coordinator.Groups()
+	if groups[0].ActiveAuthID != "" {
+		t.Fatalf("expected no active auth after all accounts exhaust, got %q", groups[0].ActiveAuthID)
+	}
+	if groups[0].SwitchPendingReason != CodexQueueSwitchReasonNoCandidate {
+		t.Fatalf("switch reason = %q, want %q", groups[0].SwitchPendingReason, CodexQueueSwitchReasonNoCandidate)
+	}
+	for _, id := range []string{"auth-1", "auth-2", "auth-3"} {
+		if !coordinator.IsQueueRoutingBlocked(id) {
+			t.Fatalf("exhausted auth %q must stay routing-blocked when no fallback remains", id)
+		}
+	}
+
+	for id := range quotas {
+		quotas[id] = 80
+	}
+	if changed := coordinator.ResetGroup(codexQueueGlobalGroupKey); changed != 3 {
+		t.Fatalf("ResetGroup changed %d auths, want 3", changed)
+	}
+	now = now.Add(2 * time.Minute)
+	coordinator.Reconcile(context.Background())
+	groups = coordinator.Groups()
+	if groups[0].ActiveAuthID != "auth-1" {
+		t.Fatalf("after reset active = %q, want auth-1", groups[0].ActiveAuthID)
+	}
+	if coordinator.IsQueueRoutingBlocked("auth-1") {
+		t.Fatalf("reset healthy active auth-1 must be routable")
+	}
+}
+
 func TestCoordinatorRecordRealRequestResetsTimer(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	coordinator := manager.EnsureCodexQueueCoordinator()
@@ -178,6 +331,12 @@ func TestCoordinatorRecordRealRequestResetsTimer(t *testing.T) {
 	if groupsMid[0].ActiveAuthID != active {
 		t.Fatalf("expected active unchanged at idle+2m, got %q (was %q)", groupsMid[0].ActiveAuthID, active)
 	}
+	if state := coordinator.AuthState(active); state == nil || state.QueueState != CodexQueueStateSwitchPending {
+		t.Fatalf("expected active to stay switch_pending before idle window, got %+v", state)
+	}
+	if groupsMid[0].SwitchPendingReason != CodexQueueSwitchReasonAwaitingIdle {
+		t.Fatalf("switch reason = %q, want %q", groupsMid[0].SwitchPendingReason, CodexQueueSwitchReasonAwaitingIdle)
+	}
 
 	// Advance well beyond the idle window since the last real request. The
 	// standby auth still has healthy quota, so promotion must occur.
@@ -206,6 +365,75 @@ func TestCoordinatorIgnoresFreePlans(t *testing.T) {
 
 	if state := coordinator.AuthState("auth-free"); state != nil {
 		t.Fatalf("free plan should not appear in queue state, got %+v", state)
+	}
+}
+
+func TestCoordinatorSingleMemberGroupIsActiveAndRoutable(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	coordinator := manager.EnsureCodexQueueCoordinator()
+	auth := newQueueTestAuth("auth-single", "team-codex")
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	cfg := mustEnabledQueueConfig()
+	coordinator.ApplyConfig(cfg)
+	coordinator.SetProvider(CodexQueueQuotaProviderFunc(func(ctx context.Context, auth *Auth) (CodexQuotaSnapshot, error) {
+		return CodexQuotaSnapshot{
+			PrimaryWindow:   QuotaWindowSnapshot{PercentRemaining: 80, WindowMinutes: 300},
+			SecondaryWindow: QuotaWindowSnapshot{PercentRemaining: 40, WindowMinutes: 300},
+			Status:          CodexQuotaStatusKnown,
+		}, nil
+	}))
+
+	coordinator.Reconcile(context.Background())
+
+	groups := coordinator.Groups()
+	if len(groups) != 1 {
+		t.Fatalf("expected single group, got %d", len(groups))
+	}
+	if groups[0].ActiveAuthID != auth.ID {
+		t.Fatalf("single-member group active ID = %q, want %q", groups[0].ActiveAuthID, auth.ID)
+	}
+	state := coordinator.AuthState(auth.ID)
+	if state == nil {
+		t.Fatalf("single auth state missing")
+	}
+	if state.QueueState != CodexQueueStateActive {
+		t.Fatalf("single auth queue state = %q, want %q", state.QueueState, CodexQueueStateActive)
+	}
+	if coordinator.IsQueueRoutingBlocked(auth.ID) {
+		t.Fatalf("single active auth must not be routing-blocked")
+	}
+}
+
+func TestCoordinatorSingleManualDisabledGroupStaysManualDisabled(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	coordinator := manager.EnsureCodexQueueCoordinator()
+	auth := newQueueTestAuth("auth-single-disabled", "team-codex")
+	auth.Disabled = true
+	auth.Status = StatusDisabled
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	cfg := mustEnabledQueueConfig()
+	coordinator.ApplyConfig(cfg)
+	coordinator.Reconcile(context.Background())
+
+	groups := coordinator.Groups()
+	if len(groups) != 1 {
+		t.Fatalf("expected single group, got %d", len(groups))
+	}
+	if groups[0].ActiveAuthID != "" {
+		t.Fatalf("manual-disabled single group active ID = %q, want empty", groups[0].ActiveAuthID)
+	}
+	state := coordinator.AuthState(auth.ID)
+	if state == nil {
+		t.Fatalf("single disabled auth state missing")
+	}
+	if state.QueueState != CodexQueueStateManualDisabled {
+		t.Fatalf("single disabled auth queue state = %q, want %q", state.QueueState, CodexQueueStateManualDisabled)
 	}
 }
 
@@ -477,8 +705,11 @@ func TestQueueManagedDisabledRecoversWithDwell(t *testing.T) {
 	now = now.Add(2 * time.Minute)
 	coordinator.Reconcile(context.Background())
 	groups = coordinator.Groups()
-	if groups[0].ActiveAuthID != standby {
-		t.Fatalf("recovered auth should dwell before promotion, active = %q", groups[0].ActiveAuthID)
+	if groups[0].ActiveAuthID != "" {
+		t.Fatalf("no recovered candidate should be routable during dwell, active = %q", groups[0].ActiveAuthID)
+	}
+	if groups[0].SwitchPendingReason != CodexQueueSwitchReasonNoCandidate {
+		t.Fatalf("switch reason = %q, want %q", groups[0].SwitchPendingReason, CodexQueueSwitchReasonNoCandidate)
 	}
 	recovered := coordinator.AuthState(firstActive)
 	if recovered == nil {
@@ -492,6 +723,9 @@ func TestQueueManagedDisabledRecoversWithDwell(t *testing.T) {
 	}
 	if recovered.RecoveryReadyAt.IsZero() || !recovered.RecoveryReadyAt.After(now) {
 		t.Fatalf("expected future recovery dwell, got %v at %v", recovered.RecoveryReadyAt, now)
+	}
+	if !coordinator.IsQueueManagedDisabled(standby) {
+		t.Fatalf("low-quota standby should be queue-managed disabled when no recovered candidate is ready")
 	}
 
 	now = now.Add(3 * time.Minute)

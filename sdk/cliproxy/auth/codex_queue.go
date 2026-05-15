@@ -2,9 +2,6 @@ package auth
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"sort"
 	"strings"
@@ -42,6 +39,7 @@ const (
 	CodexQueueSwitchReasonQuotaStale   = "quota_stale"
 
 	codexQueueStaleSnapshotMultiplier = 2
+	codexQueueGlobalGroupKey          = "codex-global"
 )
 
 // QuotaWindowSnapshot captures one Codex usage window.
@@ -337,16 +335,12 @@ func (c *CodexQueueCoordinator) rebuildGroups(auths []*Auth, cfg internalconfig.
 	groupMembers := make(map[string][]string)
 	authGroup := make(map[string]string)
 	manualDisabled := make(map[string]bool)
-	keys := cfg.EffectiveGroupBy()
 
 	for _, a := range auths {
 		if !isCodexOAuthCandidate(a) {
 			continue
 		}
-		key := codexGroupKey(a, keys)
-		if key == "" {
-			continue
-		}
+		key := codexQueueGlobalGroupKey
 		groupMembers[key] = append(groupMembers[key], a.ID)
 		authGroup[a.ID] = key
 		manualDisabled[a.ID] = a.Disabled || a.Status == StatusDisabled
@@ -381,6 +375,9 @@ func (c *CodexQueueCoordinator) rebuildGroups(auths []*Auth, cfg internalconfig.
 		if manualDisabled[prev] {
 			continue
 		}
+		if state := c.states[prev]; state != nil && state.QueueManagedDisabled {
+			continue
+		}
 		for _, id := range members {
 			if id == prev {
 				groupActive[k] = prev
@@ -409,13 +406,6 @@ func (c *CodexQueueCoordinator) rebuildGroups(auths []*Auth, cfg internalconfig.
 				continue
 			}
 			state.QueuePosition = idx + 1
-			if len(members) < 2 {
-				state.QueueState = CodexQueueStateIneligibleGroup
-				state.QueueManagedDisabled = false
-				state.QueueDisabledReason = ""
-				state.RecoveryReadyAt = time.Time{}
-				continue
-			}
 			if manualDisabled[authID] {
 				state.QueueState = CodexQueueStateManualDisabled
 				// Manual disable always wins. Clear queue-managed flags so
@@ -546,15 +536,7 @@ func (c *CodexQueueCoordinator) evaluateState(cfg internalconfig.CodexQueueConfi
 
 	c.mu.Lock()
 	for groupKey, members := range c.groupMembers {
-		if len(members) < 2 {
-			c.groupReason[groupKey] = ""
-			c.groupUpdatedAt[groupKey] = now
-			for _, id := range members {
-				dirty[id] = struct{}{}
-			}
-			continue
-		}
-		// Every member of an eligible queue group is routing-sensitive on
+		// Every member of the global queue group is routing-sensitive on
 		// every pass: scheduler eligibility flips depending on whether the
 		// member is the elected active or not.
 		for _, id := range members {
@@ -666,17 +648,17 @@ func (c *CodexQueueCoordinator) evaluateState(cfg internalconfig.CodexQueueConfi
 		}
 
 		candidate := c.firstPromotableLocked(groupKey, activeID, cfg, false)
-		if candidate == "" {
-			c.groupReason[groupKey] = CodexQueueSwitchReasonNoCandidate
-			c.groupUpdatedAt[groupKey] = now
-			continue
-		}
-
 		if autoDisable {
 			activeState.QueueManagedDisabled = true
 			activeState.QueueDisabledReason = CodexQueueDisableReasonLowQuota
 			activeState.RecoveryReadyAt = time.Time{}
 			activeState.QueueState = CodexQueueStateManagedDisabled
+		}
+		if candidate == "" {
+			delete(c.groupActive, groupKey)
+			c.groupReason[groupKey] = CodexQueueSwitchReasonNoCandidate
+			c.groupUpdatedAt[groupKey] = now
+			continue
 		}
 		if next := c.states[candidate]; next != nil {
 			next.QueueManagedDisabled = false
@@ -889,16 +871,15 @@ func (c *CodexQueueCoordinator) IsQueueManagedDisabled(authID string) bool {
 
 // IsQueueRoutingBlocked reports whether the given auth must be excluded from
 // scheduler routing because queue mode is enforcing "one active at a time"
-// for its group. Auths that are not part of any eligible queue group (e.g.
-// singletons or non-Codex auths) are not affected; the scheduler keeps its
+// for the global Codex queue. Auths that are not part of the queue (e.g.
+// non-Codex auths) are not affected; the scheduler keeps its
 // existing behavior for them.
 //
 // The check returns true when any of the following holds:
 //   - the auth has been explicitly marked queue-managed disabled (auto switch
 //     after low quota plus idle window);
-//   - the auth is a member of an eligible queue group (>=2 members) and is
-//     not the currently elected active auth for the group, including the
-//     transient case where the coordinator has not yet elected one.
+//   - the auth is a global queue member and is not the currently elected
+//     active auth, including the terminal case where no candidate remains.
 func (c *CodexQueueCoordinator) IsQueueRoutingBlocked(authID string) bool {
 	if c == nil {
 		return false
@@ -923,21 +904,8 @@ func (c *CodexQueueCoordinator) IsQueueRoutingBlocked(authID string) bool {
 	if groupKey == "" {
 		return false
 	}
-	members := c.groupMembers[groupKey]
-	if len(members) < 2 {
-		return false
-	}
 	active := c.groupActive[groupKey]
 	if active == "" {
-		// During the transient window between rebuildGroups and
-		// firstPromotableLocked picking an active, block every member
-		// except a deterministic fallback so requests still find one
-		// auth. The fallback is the first member alphabetically; this is
-		// stable across processes and matches the order used by
-		// firstPromotableLocked.
-		if len(members) > 0 && members[0] == authID {
-			return false
-		}
 		return true
 	}
 	return active != authID
@@ -1135,85 +1103,6 @@ func codexAccessToken(a *Auth) string {
 		return strings.TrimSpace(v)
 	}
 	return ""
-}
-
-// codexGroupKey returns a stable hash describing the equivalence group for one
-// Codex auth. The set of components included is taken from the configured
-// group_by list. The hash is opaque to callers.
-func codexGroupKey(a *Auth, components []string) string {
-	if a == nil {
-		return ""
-	}
-	if len(components) == 0 {
-		components = (internalconfig.CodexQueueConfig{}).EffectiveGroupBy()
-	}
-	type kv struct {
-		Key   string
-		Value string
-	}
-	parts := []kv{{Key: "provider", Value: "codex"}}
-	for _, c := range components {
-		switch strings.ToLower(strings.TrimSpace(c)) {
-		case "prefix":
-			parts = append(parts, kv{Key: "prefix", Value: strings.TrimSpace(a.Prefix)})
-		case "models":
-			set := supportedModelSetForAuth(a.ID)
-			models := make([]string, 0, len(set))
-			for m := range set {
-				models = append(models, m)
-			}
-			sort.Strings(models)
-			parts = append(parts, kv{Key: "models", Value: strings.Join(models, "\x00")})
-		case "websockets":
-			parts = append(parts, kv{Key: "websockets", Value: boolKey(authWebsocketsEnabled(a))})
-		case "headers":
-			parts = append(parts, kv{Key: "headers", Value: stableHeaderKey(a)})
-		case "plan_type":
-			parts = append(parts, kv{Key: "plan_type", Value: strings.ToLower(strings.TrimSpace(codexPlanType(a)))})
-		}
-	}
-	sort.SliceStable(parts, func(i, j int) bool { return parts[i].Key < parts[j].Key })
-	encoded, err := json.Marshal(parts)
-	if err != nil {
-		return ""
-	}
-	sum := sha256.Sum256(encoded)
-	return hex.EncodeToString(sum[:12])
-}
-
-func boolKey(b bool) string {
-	if b {
-		return "1"
-	}
-	return "0"
-}
-
-// stableHeaderKey serializes the routing-relevant attributes (`inject_headers`,
-// `default_model`, `base_url`) into a deterministic JSON string. Missing keys
-// are normalized to "" to ensure identical group keys across processes.
-func stableHeaderKey(a *Auth) string {
-	if a == nil {
-		return ""
-	}
-	type entry struct {
-		Key   string
-		Value string
-	}
-	picks := []entry{
-		{Key: "inject_headers"},
-		{Key: "default_model"},
-		{Key: "base_url"},
-	}
-	for i := range picks {
-		if a.Attributes != nil {
-			picks[i].Value = strings.TrimSpace(a.Attributes[picks[i].Key])
-		}
-	}
-	encoded, err := json.Marshal(picks)
-	if err != nil {
-		return ""
-	}
-	return string(encoded)
 }
 
 func redactQuotaError(err error) string {

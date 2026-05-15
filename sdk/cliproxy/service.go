@@ -97,6 +97,12 @@ type Service struct {
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
 
+	// warmupRunner owns scheduled synthetic provider warmup traffic.
+	warmupRunner *authProviderWarmupRunner
+
+	// warmupMu serializes scheduled warmup lifecycle updates.
+	warmupMu sync.Mutex
+
 	homeClient *home.Client
 	homeCancel context.CancelFunc
 }
@@ -560,6 +566,7 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 		s.applyCodexQueueConfig(newCfg)
 	}
 	s.rebindExecutors()
+	s.applyAuthProviderWarmupConfig(newCfg)
 }
 
 // applyCodexQueueConfig wires the Codex OAuth queue coordinator with the
@@ -806,9 +813,9 @@ func (s *Service) Run(ctx context.Context) error {
 		redisqueue.SetUsageStatisticsEnabled(true)
 	}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
 	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
 		if err := s.Shutdown(shutdownCtx); err != nil {
 			log.Errorf("service shutdown returned error: %v", err)
 		}
@@ -985,6 +992,9 @@ func (s *Service) Run(ctx context.Context) error {
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
+	if !homeEnabled {
+		s.applyAuthProviderWarmupConfig(s.cfg)
+	}
 
 	select {
 	case <-ctx.Done():
@@ -1031,6 +1041,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
+		}
+		if errStopWarmup := s.stopAuthProviderWarmupWithContext(ctx); errStopWarmup != nil {
+			log.Errorf("failed to stop auth provider warmup scheduler: %v", errStopWarmup)
+			shutdownErr = errStopWarmup
 		}
 		if s.watcher != nil {
 			if err := s.watcher.Stop(); err != nil {
