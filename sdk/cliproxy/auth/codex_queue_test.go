@@ -416,6 +416,153 @@ func TestQueueRoutingBlockedDisabledWhenQueueOff(t *testing.T) {
 	}
 }
 
+func TestQueueManagedDisabledRecoversWithDwell(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	coordinator := manager.EnsureCodexQueueCoordinator()
+	coordinator.standbyRefreshEvery = 0
+	coordinator.activeRefreshEvery = 0
+
+	base := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	now := base
+	coordinator.now = func() time.Time { return now }
+
+	a1 := newQueueTestAuth("auth-1", "team-codex")
+	a2 := newQueueTestAuth("auth-2", "team-codex")
+	if _, err := manager.Register(context.Background(), a1); err != nil {
+		t.Fatalf("register a1: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), a2); err != nil {
+		t.Fatalf("register a2: %v", err)
+	}
+
+	cfg := mustEnabledQueueConfig()
+	cfg.IdleWindow = "1m"
+	cfg.RecoveryDwell = "2m"
+	cfg.Normalize()
+	coordinator.ApplyConfig(cfg)
+
+	quotas := map[string]float64{"auth-1": 80, "auth-2": 80}
+	coordinator.SetProvider(CodexQueueQuotaProviderFunc(func(ctx context.Context, auth *Auth) (CodexQuotaSnapshot, error) {
+		return CodexQuotaSnapshot{
+			PrimaryWindow: QuotaWindowSnapshot{PercentRemaining: quotas[auth.ID], WindowMinutes: 300},
+			Status:        CodexQuotaStatusKnown,
+		}, nil
+	}))
+
+	coordinator.Reconcile(context.Background())
+	groups := coordinator.Groups()
+	if len(groups) != 1 || groups[0].ActiveAuthID == "" {
+		t.Fatalf("expected elected active, got %+v", groups)
+	}
+	firstActive := groups[0].ActiveAuthID
+	standby := "auth-2"
+	if firstActive == "auth-2" {
+		standby = "auth-1"
+	}
+
+	quotas[firstActive] = 2
+	quotas[standby] = 80
+	now = now.Add(2 * time.Minute)
+	coordinator.Reconcile(context.Background())
+	groups = coordinator.Groups()
+	if groups[0].ActiveAuthID != standby {
+		t.Fatalf("expected promotion to %q, got %q", standby, groups[0].ActiveAuthID)
+	}
+	if !coordinator.IsQueueManagedDisabled(firstActive) {
+		t.Fatalf("expected %q to be queue-managed disabled", firstActive)
+	}
+
+	quotas[firstActive] = 80
+	quotas[standby] = 2
+	now = now.Add(2 * time.Minute)
+	coordinator.Reconcile(context.Background())
+	groups = coordinator.Groups()
+	if groups[0].ActiveAuthID != standby {
+		t.Fatalf("recovered auth should dwell before promotion, active = %q", groups[0].ActiveAuthID)
+	}
+	recovered := coordinator.AuthState(firstActive)
+	if recovered == nil {
+		t.Fatalf("recovered auth state missing")
+	}
+	if recovered.QueueManagedDisabled {
+		t.Fatalf("recovered auth should clear queue-managed disabled")
+	}
+	if recovered.QueueState != CodexQueueStateStandby {
+		t.Fatalf("recovered queue_state = %q, want standby", recovered.QueueState)
+	}
+	if recovered.RecoveryReadyAt.IsZero() || !recovered.RecoveryReadyAt.After(now) {
+		t.Fatalf("expected future recovery dwell, got %v at %v", recovered.RecoveryReadyAt, now)
+	}
+
+	now = now.Add(3 * time.Minute)
+	coordinator.Reconcile(context.Background())
+	groups = coordinator.Groups()
+	if groups[0].ActiveAuthID != firstActive {
+		t.Fatalf("expected promotion after dwell to %q, got %q", firstActive, groups[0].ActiveAuthID)
+	}
+}
+
+func TestQueueManagedDisabledDoesNotRecoverFromStaleQuota(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	coordinator := manager.EnsureCodexQueueCoordinator()
+
+	now := time.Date(2026, 5, 15, 13, 0, 0, 0, time.UTC)
+	coordinator.now = func() time.Time { return now }
+
+	a1 := newQueueTestAuth("auth-1", "team-codex")
+	a2 := newQueueTestAuth("auth-2", "team-codex")
+	if _, err := manager.Register(context.Background(), a1); err != nil {
+		t.Fatalf("register a1: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), a2); err != nil {
+		t.Fatalf("register a2: %v", err)
+	}
+
+	cfg := mustEnabledQueueConfig()
+	coordinator.ApplyConfig(cfg)
+	coordinator.SetProvider(CodexQueueQuotaProviderFunc(func(ctx context.Context, auth *Auth) (CodexQuotaSnapshot, error) {
+		return CodexQuotaSnapshot{
+			PrimaryWindow: QuotaWindowSnapshot{PercentRemaining: 80, WindowMinutes: 300},
+			Status:        CodexQuotaStatusKnown,
+		}, nil
+	}))
+	coordinator.Reconcile(context.Background())
+
+	groups := coordinator.Groups()
+	if len(groups) != 1 || groups[0].ActiveAuthID == "" {
+		t.Fatalf("expected elected active, got %+v", groups)
+	}
+	managed := "auth-2"
+	if groups[0].ActiveAuthID == "auth-2" {
+		managed = "auth-1"
+	}
+
+	coordinator.mu.Lock()
+	state := coordinator.states[managed]
+	state.QueueManagedDisabled = true
+	state.QueueDisabledReason = CodexQueueDisableReasonLowQuota
+	state.QueueState = CodexQueueStateManagedDisabled
+	state.Quota = CodexQuotaSnapshot{
+		PrimaryWindow: QuotaWindowSnapshot{PercentRemaining: 80, WindowMinutes: 300},
+		Status:        CodexQuotaStatusKnown,
+		Stale:         true,
+		FetchedAt:     now,
+	}
+	coordinator.mu.Unlock()
+
+	coordinator.evaluateState(cfg)
+	got := coordinator.AuthState(managed)
+	if got == nil {
+		t.Fatalf("managed state missing")
+	}
+	if !got.QueueManagedDisabled {
+		t.Fatalf("stale snapshot must not clear queue-managed disabled")
+	}
+	if got.QueueState != CodexQueueStateManagedDisabled {
+		t.Fatalf("queue_state = %q, want managed_disabled", got.QueueState)
+	}
+}
+
 func TestRedactQuotaErrorRemovesBearer(t *testing.T) {
 	err := errors.New("failed: Bearer abc123 - chatgpt-account-id=acct_42")
 	redacted := redactQuotaError(err)

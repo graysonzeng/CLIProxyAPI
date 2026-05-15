@@ -96,6 +96,9 @@ type Config struct {
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
 
+	// AuthProviderWarmup configures opt-in synthetic provider warmup traffic.
+	AuthProviderWarmup AuthProviderWarmupConfig `yaml:"auth-provider-warmup,omitempty" json:"auth-provider-warmup,omitempty"`
+
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
 
@@ -267,6 +270,10 @@ type CodexQueueConfig struct {
 	// Accepts Go duration strings (e.g. "10m", "5m30s"). Default: 10m.
 	IdleWindow string `yaml:"idle-window,omitempty" json:"idle-window,omitempty"`
 
+	// RecoveryDwell is the minimum dwell after automatic queue recovery before
+	// the recovered auth can become a promotion candidate again. Default: 30s.
+	RecoveryDwell string `yaml:"recovery-dwell,omitempty" json:"recovery-dwell,omitempty"`
+
 	// UnknownQuotaPolicy controls how the coordinator treats an auth with no
 	// known quota snapshot. Supported values:
 	//   - "skip" (default): never promote an auth whose quota is unknown.
@@ -289,8 +296,14 @@ type CodexQueueConfig struct {
 const (
 	CodexQueueDefaultThresholdPercent   = 10.0
 	CodexQueueDefaultIdleWindow         = "10m"
+	CodexQueueDefaultRecoveryDwell      = "30s"
 	CodexQueueUnknownQuotaPolicySkip    = "skip"
 	CodexQueueUnknownQuotaPolicyPromote = "promote"
+
+	AuthProviderWarmupDefaultInterval       = "1h"
+	AuthProviderWarmupDefaultJitter         = "5m"
+	AuthProviderWarmupDefaultPrompt         = "ping"
+	AuthProviderWarmupDefaultMaxConcurrency = 1
 )
 
 // codexQueueDefaultGroupBy is the default equivalence-key set used when the
@@ -318,6 +331,9 @@ func (c *CodexQueueConfig) Normalize() {
 	}
 	if strings.TrimSpace(c.IdleWindow) == "" {
 		c.IdleWindow = CodexQueueDefaultIdleWindow
+	}
+	if strings.TrimSpace(c.RecoveryDwell) == "" {
+		c.RecoveryDwell = CodexQueueDefaultRecoveryDwell
 	}
 	policy := strings.ToLower(strings.TrimSpace(c.UnknownQuotaPolicy))
 	switch policy {
@@ -357,6 +373,20 @@ func (c CodexQueueConfig) AutoDisableCurrentEnabled() bool {
 	return *c.AutoDisableCurrent
 }
 
+// RecoveryDwellDuration parses the configured queue recovery dwell duration.
+func (c CodexQueueConfig) RecoveryDwellDuration() time.Duration {
+	value := strings.TrimSpace(c.RecoveryDwell)
+	if value == "" {
+		value = CodexQueueDefaultRecoveryDwell
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		fallback, _ := time.ParseDuration(CodexQueueDefaultRecoveryDwell)
+		return fallback
+	}
+	return parsed
+}
+
 // EffectiveGroupBy returns the sanitized group_by list, falling back to the
 // default when none is configured.
 func (c CodexQueueConfig) EffectiveGroupBy() []string {
@@ -392,6 +422,109 @@ func sanitizeCodexQueueGroupBy(in []string) []string {
 	}
 	if len(out) == 0 {
 		return nil
+	}
+	return out
+}
+
+// AuthProviderWarmupConfig configures opt-in provider warmup traffic.
+type AuthProviderWarmupConfig struct {
+	Enabled        bool                   `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Interval       string                 `yaml:"interval,omitempty" json:"interval,omitempty"`
+	Jitter         string                 `yaml:"jitter,omitempty" json:"jitter,omitempty"`
+	MaxConcurrency int                    `yaml:"max-concurrency,omitempty" json:"max-concurrency,omitempty"`
+	Prompt         string                 `yaml:"prompt,omitempty" json:"prompt,omitempty"`
+	Providers      []WarmupProviderConfig `yaml:"providers,omitempty" json:"providers,omitempty"`
+}
+
+// WarmupProviderConfig describes one provider row in auth-provider-warmup.
+type WarmupProviderConfig struct {
+	Provider              string   `yaml:"provider" json:"provider"`
+	Enabled               bool     `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Model                 string   `yaml:"model,omitempty" json:"model,omitempty"`
+	Interval              string   `yaml:"interval,omitempty" json:"interval,omitempty"`
+	Jitter                string   `yaml:"jitter,omitempty" json:"jitter,omitempty"`
+	Prompt                string   `yaml:"prompt,omitempty" json:"prompt,omitempty"`
+	AuthIndexes           []string `yaml:"auth-indexes,omitempty" json:"auth-indexes,omitempty"`
+	SkipWhenQuotaExceeded bool     `yaml:"skip-when-quota-exceeded,omitempty" json:"skip-when-quota-exceeded,omitempty"`
+}
+
+// WarmupRuntimeStatus is the stable management-facing status shape reserved for
+// the scheduled warmup service.
+type WarmupRuntimeStatus struct {
+	Provider            string `json:"provider"`
+	AuthID              string `json:"auth_id,omitempty"`
+	AuthIndex           string `json:"auth_index,omitempty"`
+	Model               string `json:"model,omitempty"`
+	LastRunAt           string `json:"last_run_at,omitempty"`
+	LastSuccessAt       string `json:"last_success_at,omitempty"`
+	NextRunAt           string `json:"next_run_at,omitempty"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	LastError           string `json:"last_error,omitempty"`
+}
+
+// WarmupSupportedProviders is the single source of truth for provider warmup allowlists.
+var WarmupSupportedProviders = []string{"antigravity", "claude", "codex", "kiro"}
+
+// IsWarmupSupportedProvider reports whether provider supports warmup.
+func IsWarmupSupportedProvider(provider string) bool {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	for _, candidate := range WarmupSupportedProviders {
+		if provider == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+// Normalize fills warmup defaults and sanitizes provider entries.
+func (c *AuthProviderWarmupConfig) Normalize() {
+	if c == nil {
+		return
+	}
+	if strings.TrimSpace(c.Interval) == "" {
+		c.Interval = AuthProviderWarmupDefaultInterval
+	}
+	if strings.TrimSpace(c.Jitter) == "" {
+		c.Jitter = AuthProviderWarmupDefaultJitter
+	}
+	if strings.TrimSpace(c.Prompt) == "" {
+		c.Prompt = AuthProviderWarmupDefaultPrompt
+	}
+	if c.MaxConcurrency <= 0 {
+		c.MaxConcurrency = AuthProviderWarmupDefaultMaxConcurrency
+	}
+	out := make([]WarmupProviderConfig, 0, len(c.Providers))
+	for _, providerCfg := range c.Providers {
+		providerCfg.Provider = strings.ToLower(strings.TrimSpace(providerCfg.Provider))
+		if !IsWarmupSupportedProvider(providerCfg.Provider) {
+			continue
+		}
+		providerCfg.Model = strings.TrimSpace(providerCfg.Model)
+		providerCfg.Interval = strings.TrimSpace(providerCfg.Interval)
+		providerCfg.Jitter = strings.TrimSpace(providerCfg.Jitter)
+		providerCfg.Prompt = strings.TrimSpace(providerCfg.Prompt)
+		providerCfg.AuthIndexes = sanitizeWarmupAuthIndexes(providerCfg.AuthIndexes)
+		out = append(out, providerCfg)
+	}
+	c.Providers = out
+}
+
+func sanitizeWarmupAuthIndexes(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
 	}
 	return out
 }
@@ -886,6 +1019,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Normalize Codex queue mode defaults.
 	cfg.Routing.CodexQueue.Normalize()
+
+	// Normalize provider warmup defaults.
+	cfg.AuthProviderWarmup.Normalize()
 
 	// NOTE: Legacy migration persistence is intentionally disabled together with
 	// startup legacy migration to keep startup read-only for config.yaml.

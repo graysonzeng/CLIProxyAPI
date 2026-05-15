@@ -70,6 +70,7 @@ type CodexQueueAuthState struct {
 	QueueState           string             `json:"queue_state"`
 	QueueManagedDisabled bool               `json:"queue_managed_disabled"`
 	QueueDisabledReason  string             `json:"queue_disabled_reason,omitempty"`
+	RecoveryReadyAt      time.Time          `json:"recovery_ready_at,omitempty"`
 	LastRealRequestAt    time.Time          `json:"last_real_request_at,omitempty"`
 	SwitchPendingSince   time.Time          `json:"switch_pending_since,omitempty"`
 	Quota                CodexQuotaSnapshot `json:"quota"`
@@ -412,6 +413,7 @@ func (c *CodexQueueCoordinator) rebuildGroups(auths []*Auth, cfg internalconfig.
 				state.QueueState = CodexQueueStateIneligibleGroup
 				state.QueueManagedDisabled = false
 				state.QueueDisabledReason = ""
+				state.RecoveryReadyAt = time.Time{}
 				continue
 			}
 			if manualDisabled[authID] {
@@ -420,9 +422,11 @@ func (c *CodexQueueCoordinator) rebuildGroups(auths []*Auth, cfg internalconfig.
 				// the operator-owned disable status is not masked.
 				state.QueueManagedDisabled = false
 				state.QueueDisabledReason = ""
+				state.RecoveryReadyAt = time.Time{}
 				continue
 			}
 			if c.groupActive[k] == authID {
+				state.RecoveryReadyAt = time.Time{}
 				state.QueueState = CodexQueueStateActive
 				continue
 			}
@@ -569,14 +573,25 @@ func (c *CodexQueueCoordinator) evaluateState(cfg internalconfig.CodexQueueConfi
 				state.QueueState = CodexQueueStateManualDisabled
 				state.QueueManagedDisabled = false
 				state.QueueDisabledReason = ""
+				state.RecoveryReadyAt = time.Time{}
 				continue
 			}
 			if c.groupActive[groupKey] == id {
 				continue
 			}
 			if state.QueueManagedDisabled {
+				if queueRecoveryEligible(state, threshold, c.manualDisabled[id]) {
+					state.QueueManagedDisabled = false
+					state.QueueDisabledReason = ""
+					state.QueueState = CodexQueueStateStandby
+					state.RecoveryReadyAt = now.Add(cfg.RecoveryDwellDuration())
+					continue
+				}
 				state.QueueState = CodexQueueStateManagedDisabled
 				continue
+			}
+			if !state.RecoveryReadyAt.IsZero() && !now.Before(state.RecoveryReadyAt) {
+				state.RecoveryReadyAt = time.Time{}
 			}
 			switch state.Quota.Status {
 			case CodexQuotaStatusError:
@@ -597,6 +612,7 @@ func (c *CodexQueueCoordinator) evaluateState(cfg internalconfig.CodexQueueConfi
 				if state := c.states[candidate]; state != nil {
 					state.QueueManagedDisabled = false
 					state.QueueDisabledReason = ""
+					state.RecoveryReadyAt = time.Time{}
 					state.QueueState = CodexQueueStateActive
 					if state.LastRealRequestAt.IsZero() {
 						state.LastRealRequestAt = now
@@ -659,11 +675,13 @@ func (c *CodexQueueCoordinator) evaluateState(cfg internalconfig.CodexQueueConfi
 		if autoDisable {
 			activeState.QueueManagedDisabled = true
 			activeState.QueueDisabledReason = CodexQueueDisableReasonLowQuota
+			activeState.RecoveryReadyAt = time.Time{}
 			activeState.QueueState = CodexQueueStateManagedDisabled
 		}
 		if next := c.states[candidate]; next != nil {
 			next.QueueManagedDisabled = false
 			next.QueueDisabledReason = ""
+			next.RecoveryReadyAt = time.Time{}
 			next.QueueState = CodexQueueStateActive
 			next.SwitchPendingSince = time.Time{}
 			next.LastRealRequestAt = now
@@ -716,6 +734,7 @@ func (c *CodexQueueCoordinator) firstPromotableLocked(groupKey, excludeID string
 	members := c.groupMembers[groupKey]
 	threshold := cfg.ThresholdPercent
 	unknownPolicy := strings.ToLower(strings.TrimSpace(cfg.UnknownQuotaPolicy))
+	now := c.now()
 	for _, id := range members {
 		if id == excludeID {
 			continue
@@ -725,6 +744,9 @@ func (c *CodexQueueCoordinator) firstPromotableLocked(groupKey, excludeID string
 			continue
 		}
 		if state.QueueManagedDisabled {
+			continue
+		}
+		if !state.RecoveryReadyAt.IsZero() && now.Before(state.RecoveryReadyAt) {
 			continue
 		}
 		// Manual disabled wins; never promote.
@@ -768,6 +790,7 @@ func (c *CodexQueueCoordinator) clearAllManagedDisabled(queueWasEnabled bool) {
 			state.QueueManagedDisabled = false
 			state.QueueDisabledReason = ""
 		}
+		state.RecoveryReadyAt = time.Time{}
 		state.SwitchPendingSince = time.Time{}
 		// When queue mode is being disabled, re-register every member so
 		// the scheduler stops treating non-active group members as
@@ -801,6 +824,7 @@ func (c *CodexQueueCoordinator) ResetGroup(groupKey string) int {
 		if state.QueueManagedDisabled {
 			state.QueueManagedDisabled = false
 			state.QueueDisabledReason = ""
+			state.RecoveryReadyAt = time.Time{}
 			state.QueueState = CodexQueueStateStandby
 			refresh = append(refresh, id)
 		}
@@ -836,6 +860,7 @@ func (c *CodexQueueCoordinator) ResetAuth(authID string) bool {
 	}
 	state.QueueManagedDisabled = false
 	state.QueueDisabledReason = ""
+	state.RecoveryReadyAt = time.Time{}
 	state.QueueState = CodexQueueStateStandby
 	state.SwitchPendingSince = time.Time{}
 	c.mu.Unlock()
@@ -995,6 +1020,16 @@ func (c *CodexQueueCoordinator) pushSchedulerUpdatesForAuthIDs(ids []string) {
 	for _, id := range ids {
 		c.pushSchedulerUpdate(id)
 	}
+}
+
+func queueRecoveryEligible(state *CodexQueueAuthState, threshold float64, manualDisabled bool) bool {
+	if state == nil {
+		return false
+	}
+	return state.Quota.Status == CodexQuotaStatusKnown &&
+		!state.Quota.Stale &&
+		!isLowQuota(state.Quota, threshold) &&
+		!manualDisabled
 }
 
 // isLowQuota reports whether any known window's percent-remaining falls below

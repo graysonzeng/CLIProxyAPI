@@ -128,6 +128,32 @@ routing:
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
+  # Optional Codex OAuth queue mode. Only one auth in an equivalent group is routed at a time.
+  # codex-queue:
+  #   enabled: false
+  #   threshold-percent: 10
+  #   idle-window: "10m"
+  #   recovery-dwell: "30s"
+  #   unknown-quota-policy: "skip"
+  #   auto-disable-current: true
+
+# Optional scheduled provider warmup. Disabled by default; enabled providers create real upstream traffic.
+# auth-provider-warmup:
+#   enabled: false
+#   interval: "1h"
+#   jitter: "5m"
+#   max-concurrency: 1
+#   prompt: "ping"
+#   providers:
+#     - provider: "kiro"
+#       enabled: true
+#       model: "claude-haiku-4-5-20251001"
+#     - provider: "codex"
+#       enabled: true
+#       model: "gpt-5.3-codex"
+#       interval: "1h"
+#       skip-when-quota-exceeded: true
+#       auth-indexes: ["0001", "0002"]
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false

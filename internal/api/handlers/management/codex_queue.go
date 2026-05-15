@@ -15,6 +15,7 @@ type codexQueueResponse struct {
 	Enabled            bool     `json:"enabled"`
 	ThresholdPercent   float64  `json:"threshold-percent"`
 	IdleWindow         string   `json:"idle-window"`
+	RecoveryDwell      string   `json:"recovery-dwell"`
 	UnknownQuotaPolicy string   `json:"unknown-quota-policy"`
 	AutoDisableCurrent bool     `json:"auto-disable-current"`
 	GroupBy            []string `json:"group-by"`
@@ -26,6 +27,7 @@ func codexQueueConfigToResponse(cfg config.CodexQueueConfig) codexQueueResponse 
 		Enabled:            cfg.Enabled,
 		ThresholdPercent:   cfg.ThresholdPercent,
 		IdleWindow:         cfg.IdleWindow,
+		RecoveryDwell:      cfg.RecoveryDwell,
 		UnknownQuotaPolicy: cfg.UnknownQuotaPolicy,
 		AutoDisableCurrent: cfg.AutoDisableCurrentEnabled(),
 		GroupBy:            cfg.EffectiveGroupBy(),
@@ -38,6 +40,7 @@ func (h *Handler) GetCodexQueueConfig(c *gin.Context) {
 		c.JSON(http.StatusOK, codexQueueResponse{
 			ThresholdPercent:   config.CodexQueueDefaultThresholdPercent,
 			IdleWindow:         config.CodexQueueDefaultIdleWindow,
+			RecoveryDwell:      config.CodexQueueDefaultRecoveryDwell,
 			UnknownQuotaPolicy: config.CodexQueueUnknownQuotaPolicySkip,
 			AutoDisableCurrent: true,
 			GroupBy:            (config.CodexQueueConfig{}).EffectiveGroupBy(),
@@ -54,6 +57,7 @@ type codexQueueUpdateRequest struct {
 	Enabled            *bool    `json:"enabled,omitempty"`
 	ThresholdPercent   *float64 `json:"threshold-percent,omitempty"`
 	IdleWindow         *string  `json:"idle-window,omitempty"`
+	RecoveryDwell      *string  `json:"recovery-dwell,omitempty"`
 	UnknownQuotaPolicy *string  `json:"unknown-quota-policy,omitempty"`
 	AutoDisableCurrent *bool    `json:"auto-disable-current,omitempty"`
 	GroupBy            []string `json:"group-by,omitempty"`
@@ -82,6 +86,9 @@ func (h *Handler) PutCodexQueueConfig(c *gin.Context) {
 	if body.IdleWindow != nil {
 		current.IdleWindow = strings.TrimSpace(*body.IdleWindow)
 	}
+	if body.RecoveryDwell != nil {
+		current.RecoveryDwell = strings.TrimSpace(*body.RecoveryDwell)
+	}
 	if body.UnknownQuotaPolicy != nil {
 		current.UnknownQuotaPolicy = strings.TrimSpace(*body.UnknownQuotaPolicy)
 	}
@@ -108,6 +115,13 @@ func (h *Handler) PutCodexQueueConfig(c *gin.Context) {
 		if _, err := time.ParseDuration(current.IdleWindow); err != nil {
 			h.mu.Unlock()
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid idle-window"})
+			return
+		}
+	}
+	if current.RecoveryDwell != "" {
+		if _, err := time.ParseDuration(current.RecoveryDwell); err != nil {
+			h.mu.Unlock()
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid recovery-dwell"})
 			return
 		}
 	}

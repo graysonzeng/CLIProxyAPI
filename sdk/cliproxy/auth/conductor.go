@@ -638,6 +638,15 @@ func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]stri
 	return m.filterExecutionModels(auth, routeModel, candidates, pooled), pooled
 }
 
+func (m *Manager) preparedExecutionModelsForRequest(auth *Auth, routeModel string, opts cliproxyexecutor.Options) ([]string, bool) {
+	models, pooled := m.preparedExecutionModels(auth, routeModel)
+	if len(models) == 0 && isSyntheticWarmupMetadata(opts.Metadata) && pinnedAuthIDFromMetadata(opts.Metadata) == auth.ID {
+		models = m.executionModelCandidates(auth, routeModel)
+		pooled = len(models) > 1
+	}
+	return models, pooled
+}
+
 func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string) []string {
 	models, _ := m.preparedExecutionModels(auth, routeModel)
 	return models
@@ -1370,7 +1379,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 		execCtx = WithForceRefreshAuth(execCtx, m.ForceRefreshAuth)
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.preparedExecutionModelsForRequest(auth, routeModel, opts)
 		if len(models) == 0 {
 			continue
 		}
@@ -1459,7 +1468,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 		execCtx = WithForceRefreshAuth(execCtx, m.ForceRefreshAuth)
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.preparedExecutionModelsForRequest(auth, routeModel, opts)
 		if len(models) == 0 {
 			continue
 		}
@@ -1546,7 +1555,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = WithForceRefreshAuth(execCtx, m.ForceRefreshAuth)
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.preparedExecutionModelsForRequest(auth, routeModel, opts)
 		if len(models) == 0 {
 			continue
 		}
@@ -1710,6 +1719,10 @@ func syntheticRequestKindFromMetadata(meta map[string]any) string {
 
 func isSyntheticRequestMetadata(meta map[string]any) bool {
 	return syntheticRequestKindFromMetadata(meta) != ""
+}
+
+func isSyntheticWarmupMetadata(meta map[string]any) bool {
+	return syntheticRequestKindFromMetadata(meta) == cliproxyexecutor.SyntheticRequestKindWarmup
 }
 
 func disallowFreeAuthFromMetadata(meta map[string]any) bool {
@@ -2904,6 +2917,61 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 	return m.selectionModelKeyForAuth(auth, routeModel) != canonicalModelKey(routeModel)
 }
 
+func (m *Manager) pickPinnedSyntheticWarmup(providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error, bool) {
+	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	if pinnedAuthID == "" || !isSyntheticWarmupMetadata(opts.Metadata) {
+		return nil, nil, "", nil, false
+	}
+	// A pinned synthetic warmup is an explicit diagnostic probe: the pin wins
+	// over queue routing and disallow-free selection filters, while manual
+	// Auth.Disabled still blocks execution.
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		providerKey := strings.ToLower(strings.TrimSpace(provider))
+		if providerKey != "" {
+			providerSet[providerKey] = struct{}{}
+		}
+	}
+	if len(providerSet) == 0 {
+		return nil, nil, "", &Error{Code: "provider_not_found", Message: "no provider supplied"}, true
+	}
+	if _, used := tried[pinnedAuthID]; used {
+		return nil, nil, "", &Error{Code: "auth_unavailable", Message: "no auth available"}, true
+	}
+
+	m.mu.RLock()
+	auth := m.auths[pinnedAuthID]
+	if auth == nil || auth.Disabled {
+		m.mu.RUnlock()
+		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}, true
+	}
+	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if _, ok := providerSet[providerKey]; !ok {
+		m.mu.RUnlock()
+		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}, true
+	}
+	executor, okExecutor := m.executors[providerKey]
+	if !okExecutor {
+		m.mu.RUnlock()
+		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}, true
+	}
+	if model != "" && !m.authSupportsRouteModel(registry.GetGlobalRegistry(), auth, model) {
+		m.mu.RUnlock()
+		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}, true
+	}
+	authCopy := auth.Clone()
+	m.mu.RUnlock()
+	if !authCopy.indexAssigned {
+		m.mu.Lock()
+		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+			current.EnsureIndex()
+			authCopy = current.Clone()
+		}
+		m.mu.Unlock()
+	}
+	return authCopy, executor, providerKey, nil, true
+}
+
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
@@ -2981,6 +3049,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
+		return auth, exec, err
+	}
+	if auth, exec, _, err, handled := m.pickPinnedSyntheticWarmup([]string{provider}, model, opts, tried); handled {
 		return auth, exec, err
 	}
 
@@ -3139,6 +3210,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
+	}
+	if auth, exec, providerKey, err, handled := m.pickPinnedSyntheticWarmup(providers, model, opts, tried); handled {
+		return auth, exec, providerKey, err
 	}
 
 	if !m.useSchedulerFastPath() {
