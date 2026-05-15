@@ -4,11 +4,45 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
+
+type kiroAPICallRefreshExecutor struct {
+	calls int
+}
+
+func (e *kiroAPICallRefreshExecutor) Identifier() string { return "kiro" }
+
+func (e *kiroAPICallRefreshExecutor) Execute(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *kiroAPICallRefreshExecutor) ExecuteStream(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e *kiroAPICallRefreshExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	e.calls++
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["accessToken"] = "fresh-kiro-token"
+	auth.Metadata["expiresAt"] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	return auth, nil
+}
+
+func (e *kiroAPICallRefreshExecutor) CountTokens(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *kiroAPICallRefreshExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
 
 func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	t.Parallel()
@@ -208,5 +242,39 @@ func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
 	}
 	if gotCompat.ID != compatAuth.ID {
 		t.Fatalf("authByIndex(compat) returned %q, want %q", gotCompat.ID, compatAuth.ID)
+	}
+}
+
+func TestResolveTokenForAuthRefreshesExpiredKiroToken(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	exec := &kiroAPICallRefreshExecutor{}
+	manager.RegisterExecutor(exec)
+
+	auth := &coreauth.Auth{
+		ID:       "kiro-auth",
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken":  "stale-kiro-token",
+			"refreshToken": "refresh-token",
+			"authMethod":   "social",
+			"expiresAt":    time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register kiro auth: %v", errRegister)
+	}
+
+	h := &Handler{authManager: manager}
+	got, err := h.resolveTokenForAuth(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("resolveTokenForAuth returned error: %v", err)
+	}
+	if got != "fresh-kiro-token" {
+		t.Fatalf("token = %q, want fresh-kiro-token", got)
+	}
+	if exec.calls != 1 {
+		t.Fatalf("Refresh calls = %d, want 1", exec.calls)
 	}
 }

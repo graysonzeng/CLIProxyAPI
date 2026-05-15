@@ -262,7 +262,26 @@ func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth) 
 		token, errToken := h.refreshAntigravityOAuthAccessToken(ctx, auth)
 		return token, errToken
 	}
+	if provider == "kiro" {
+		return h.resolveKiroAccessToken(ctx, auth)
+	}
 
+	return tokenValueForAuth(auth), nil
+}
+
+func (h *Handler) resolveKiroAccessToken(ctx context.Context, auth *coreauth.Auth) (string, error) {
+	if auth == nil {
+		return "", nil
+	}
+	if h != nil && h.authManager != nil && strings.TrimSpace(auth.ID) != "" {
+		refreshed, _, errRefresh := h.authManager.RefreshAuthByID(ctx, auth.ID)
+		if errRefresh != nil {
+			return "", errRefresh
+		}
+		if refreshed != nil {
+			return tokenValueForAuth(refreshed), nil
+		}
+	}
 	return tokenValueForAuth(auth), nil
 }
 
@@ -577,6 +596,9 @@ func tokenValueFromMetadata(metadata map[string]any) string {
 		return strings.TrimSpace(v)
 	}
 	if v, ok := metadata["access_token"].(string); ok && strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	if v, ok := metadata["kiroApiKey"].(string); ok && strings.TrimSpace(v) != "" {
 		return strings.TrimSpace(v)
 	}
 	if tokenRaw, ok := metadata["token"]; ok && tokenRaw != nil {
