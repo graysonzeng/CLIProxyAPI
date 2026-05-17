@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -360,6 +361,864 @@ func TestStreamKiroToClaudeSSE_WithToolUse(t *testing.T) {
 	}
 }
 
+// TestStreamKiroToClaudeSSE_ToolUseContentBlockStartIncludesEmptyInput pins the
+// Anthropic Messages API SSE contract: every `content_block_start` event for a
+// `tool_use` block must publish an initial `input` value (an empty object) in
+// its content_block payload. Strict downstream SDK parsers — notably Claude
+// Code v2.x — validate this synchronously as the event arrives. When the field
+// is missing, Claude Code reports the tool call as "Invalid tool parameters"
+// or remains stuck on "Initializing…" because input_json_delta accumulators
+// have nothing to merge into. This test mirrors AIClient2API claude-kiro.js
+// (`input: {}`) and kiro.rs anthropic/stream.rs (`"input": {}`).
+//
+// We assert the exact wire shape (including the empty-object `input` field)
+// across three representative streaming patterns Kiro uses in production:
+//  1. start-with-input then stop in a separate event
+//  2. start without input then input chunks then stop
+//  3. start-with-full-input-and-stop in a single event
+//
+// Because the proxy emits standard Claude SSE for downstream Claude clients
+// regardless of how Kiro framed the upstream events, all three must produce a
+// content_block_start whose content_block has the canonical
+// {"type":"tool_use","id":...,"name":...,"input":{}} shape.
+func TestStreamKiroToClaudeSSE_ToolUseContentBlockStartIncludesEmptyInput(t *testing.T) {
+	cases := []struct {
+		name        string
+		raw         string
+		wantToolID  string
+		wantName    string
+		wantHasName bool
+	}{
+		{
+			name:       "single event start with input shard",
+			raw:        `binary{"name": "get_weather", "toolUseId": "tu-a", "input": "{\"loc\":\"NYC\"}", "stop": false}binary{"stop": true}`,
+			wantToolID: "tu-a",
+			wantName:   "get_weather",
+		},
+		{
+			name:       "split start then input chunks then stop",
+			raw:        `binary{"name": "bash", "toolUseId": "tu-b", "stop": false}binary{"input": "{\"cmd\":\"ls\"}"}binary{"stop": true}`,
+			wantToolID: "tu-b",
+			wantName:   "bash",
+		},
+		{
+			name:       "single event start with full input and stop",
+			raw:        `binary{"name": "read_file", "toolUseId": "tu-c", "input": "{\"path\":\"/etc/hosts\"}", "stop": true}`,
+			wantToolID: "tu-c",
+			wantName:   "read_file",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := strings.NewReader(tc.raw)
+			var lines [][]byte
+			_, _ = streamKiroToClaudeSSE(nil, reader, nil, "claude-opus-4-6", func(line []byte) {
+				lines = append(lines, append([]byte(nil), line...))
+			})
+
+			var startData []byte
+			for _, line := range lines {
+				dataLines := claudeSSEDataLines(line)
+				for _, dl := range dataLines {
+					payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+					evtType := gjson.GetBytes(payload, "type").String()
+					blockType := gjson.GetBytes(payload, "content_block.type").String()
+					if evtType == "content_block_start" && blockType == "tool_use" {
+						startData = bytes.Clone(payload)
+					}
+				}
+			}
+
+			if len(startData) == 0 {
+				t.Fatalf("expected a tool_use content_block_start event, got SSE lines: %s", strings.Join(stringifyLines(lines), "|"))
+			}
+
+			block := gjson.GetBytes(startData, "content_block")
+			if block.Get("id").String() != tc.wantToolID {
+				t.Errorf("content_block.id = %q, want %q", block.Get("id").String(), tc.wantToolID)
+			}
+			if block.Get("name").String() != tc.wantName {
+				t.Errorf("content_block.name = %q, want %q", block.Get("name").String(), tc.wantName)
+			}
+			input := block.Get("input")
+			if !input.Exists() {
+				t.Fatalf("content_block.input field is missing in content_block_start event: %s", string(startData))
+			}
+			if !input.IsObject() {
+				t.Fatalf("content_block.input must be an object, got type %v: %s", input.Type, string(startData))
+			}
+			// Initial `input` must be the empty object so that downstream
+			// SDKs can apply input_json_delta partial_json shards over a
+			// well-formed initial value, and so that an empty-input tool
+			// call still produces a parseable {} rather than an
+			// undefined/null parameter set.
+			var inputMap map[string]interface{}
+			if err := json.Unmarshal([]byte(input.Raw), &inputMap); err != nil {
+				t.Fatalf("content_block.input must parse as JSON object: %v (raw=%s)", err, input.Raw)
+			}
+			if len(inputMap) != 0 {
+				t.Errorf("content_block.input must be the empty object on block start, got %v", inputMap)
+			}
+		})
+	}
+}
+
+// TestStreamKiroToClaudeSSE_DropsEmptyToolUseBeforeNextTool covers the
+// Claude Code "Invalid tool parameters" regression seen with Kiro Opus 4.6:
+// Kiro can emit a toolUse start event with no input, then immediately move on
+// to a different tool. If the proxy forwards that empty start as a Claude
+// tool_use block (`input: {}`), Claude Code executes it and reports missing
+// required parameters such as Bash.command, Read.file_path, Agent.prompt, etc.
+//
+// The proxy must therefore delay publishing a Kiro tool_use until at least one
+// input shard arrives. Empty abandoned tool starts are dropped instead of
+// becoming invalid downstream tool calls.
+func TestStreamKiroToClaudeSSE_DropsEmptyToolUseBeforeNextTool(t *testing.T) {
+	raw := `binary{"name":"Bash","toolUseId":"empty-bash","stop":false}` +
+		`binary{"name":"Read","toolUseId":"valid-read","input":"{\"file_path\":\"/tmp/a\"}","stop":true}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, _ = streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+
+	var toolStarts []gjson.Result
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "content_block_start" &&
+				gjson.GetBytes(payload, "content_block.type").String() == "tool_use" {
+				toolStarts = append(toolStarts, gjson.ParseBytes(payload))
+			}
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+
+	if len(toolStarts) != 1 {
+		t.Fatalf("expected only the valid tool_use to be emitted, got %d starts: %s", len(toolStarts), strings.Join(stringifyLines(lines), "|"))
+	}
+	block := toolStarts[0].Get("content_block")
+	if block.Get("id").String() != "valid-read" {
+		t.Fatalf("emitted wrong tool id: got %q, want valid-read", block.Get("id").String())
+	}
+	if block.Get("name").String() != "Read" {
+		t.Fatalf("emitted wrong tool name: got %q, want Read", block.Get("name").String())
+	}
+	if stopReason != "tool_use" {
+		t.Fatalf("stop_reason = %q, want tool_use because a valid tool was emitted", stopReason)
+	}
+}
+
+func TestStreamKiroToClaudeSSE_DropsIncompleteToolInput(t *testing.T) {
+	raw := `binary{"name":"Agent","toolUseId":"bad-agent","stop":false}` +
+		`binary{"input":"{\"description\":\"Explore\",\"prompt\":\"unterminated"}` +
+		`binary{"stop":true}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, _ = streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "content_block.type").String() == "tool_use" {
+				t.Fatalf("incomplete tool input must not be emitted: %s", strings.Join(stringifyLines(lines), "|"))
+			}
+		}
+	}
+}
+
+func TestStreamKiroToClaudeSSE_VisiblePreambleWithIncompleteToolCanEndTurn(t *testing.T) {
+	raw := `binary{"content":"I will explore the workspace."}` +
+		`binary{"name":"Agent","toolUseId":"bad-agent","stop":false}` +
+		`binary{"input":"{\"description\":\"Explore\",\"prompt\":\"unterminated"}` +
+		`binary{"stop":true}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "end_turn" {
+		t.Fatalf("stop_reason = %q, want end_turn for complete visible preamble with dropped tool; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ErrsOnThinkingOnlyStream(t *testing.T) {
+	raw := `binary{"content":"<thinking>\nNeed to inspect the workspace before answering."}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	result, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err == nil {
+		t.Fatalf("expected thinking-only stream to return an error, got nil; lines=%s", strings.Join(stringifyLines(lines), "|"))
+	}
+	if !strings.Contains(err.Error(), "without visible content or tool use") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.payloadStarted || len(lines) != 0 {
+		t.Fatalf("thinking-only stream must fail before emitting payload; result=%+v lines=%s", result, strings.Join(stringifyLines(lines), "|"))
+	}
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				t.Fatalf("thinking-only stream must not be finalized as end_turn: %s", strings.Join(stringifyLines(lines), "|"))
+			}
+		}
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ContentLengthExceededMapsToMaxTokens(t *testing.T) {
+	raw := `binary{"content":"partial answer"}binary-headers:exception-type` + "\x00" + `ContentLengthExceededException payload`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_SuspiciousShortIncompleteEndMapsToMaxTokens(t *testing.T) {
+	raw := `binary{"content":"<thinking>\nNeed to summarize carefully.</thinking>\n\n"}` +
+		`binary{"content":"基于探索结果，以"}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens for suspicious incomplete end; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_SuspiciousVisiblePrefixWithoutThinkingMapsToMaxTokens(t *testing.T) {
+	raw := `binary{"content":"探索完成，"}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens for suspicious visible prefix; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_IntentionOnlyAnswerMapsToMaxTokens(t *testing.T) {
+	raw := `binary{"content":"我来对当前工作区及各子项目做一轮探索。"}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens for intention-only answer; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ClaudeCodeIntentionOnlyAnswerReturnsMalformedBeforePayload(t *testing.T) {
+	raw := `binary{"content":"我来对当前工作区及各子项目做一轮探索。"}`
+	reader := strings.NewReader(raw)
+	ctx := context.WithValue(context.Background(), kiroClaudeCodeRequestKey{}, true)
+	var lines [][]byte
+	result, err := streamKiroToClaudeSSE(ctx, reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err == nil {
+		t.Fatal("streamKiroToClaudeSSE error = nil, want malformed error")
+	}
+	var kiroErr *helps.KiroError
+	if !errors.As(err, &kiroErr) || kiroErr.Classification() != helps.KiroErrStreamMalformed {
+		t.Fatalf("error = %T %v, want KiroErrStreamMalformed", err, err)
+	}
+	if result.payloadStarted || len(lines) != 0 {
+		t.Fatalf("result=%+v lines=%d, want no payload before malformed error", result, len(lines))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ClaudeCodeIntentionPreambleWithInvalidToolUseReturnsMalformedBeforePayload(t *testing.T) {
+	raw := `binary{"content":"我来探索工作区的各个子项目模块。"}` +
+		`binary{"name":"Agent","toolUseId":"bad-agent","input":"{\"prompt\":\"read project","stop":false}`
+	reader := strings.NewReader(raw)
+	ctx := context.WithValue(context.Background(), kiroClaudeCodeRequestKey{}, true)
+	var lines [][]byte
+	result, err := streamKiroToClaudeSSE(ctx, reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err == nil {
+		t.Fatal("streamKiroToClaudeSSE error = nil, want malformed error")
+	}
+	var kiroErr *helps.KiroError
+	if !errors.As(err, &kiroErr) || kiroErr.Classification() != helps.KiroErrStreamMalformed {
+		t.Fatalf("error = %T %v, want KiroErrStreamMalformed", err, err)
+	}
+	if result.payloadStarted || len(lines) != 0 {
+		t.Fatalf("result=%+v lines=%d, want no payload before malformed error", result, len(lines))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ClaudeCodeSplitIntentionPreambleWithInvalidToolUseReturnsMalformedBeforePayload(t *testing.T) {
+	raw := `binary{"content":"我"}` +
+		`binary{"content":"来探索工作区的各个子项目模块。"}` +
+		`binary{"name":"Agent","toolUseId":"bad-agent","input":"{\"prompt\":\"read project","stop":false}`
+	reader := strings.NewReader(raw)
+	ctx := context.WithValue(context.Background(), kiroClaudeCodeRequestKey{}, true)
+	var lines [][]byte
+	result, err := streamKiroToClaudeSSE(ctx, reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err == nil {
+		t.Fatal("streamKiroToClaudeSSE error = nil, want malformed error")
+	}
+	var kiroErr *helps.KiroError
+	if !errors.As(err, &kiroErr) || kiroErr.Classification() != helps.KiroErrStreamMalformed {
+		t.Fatalf("error = %T %v, want KiroErrStreamMalformed", err, err)
+	}
+	if result.payloadStarted || len(lines) != 0 {
+		t.Fatalf("result=%+v lines=%d, want no payload before malformed error", result, len(lines))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ClaudeCodeCompletionPreambleMalformedReturnsMalformedBeforePayload(t *testing.T) {
+	raw := `binary{"content":"探索完成，"}binary{"content":"oops"`
+	reader := strings.NewReader(raw)
+	ctx := context.WithValue(context.Background(), kiroClaudeCodeRequestKey{}, true)
+	var lines [][]byte
+	result, err := streamKiroToClaudeSSE(ctx, reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err == nil {
+		t.Fatal("streamKiroToClaudeSSE error = nil, want malformed error")
+	}
+	var kiroErr *helps.KiroError
+	if !errors.As(err, &kiroErr) || kiroErr.Classification() != helps.KiroErrStreamMalformed {
+		t.Fatalf("error = %T %v, want KiroErrStreamMalformed", err, err)
+	}
+	if result.payloadStarted || len(lines) != 0 {
+		t.Fatalf("result=%+v lines=%d, want no payload before malformed error", result, len(lines))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_LetMeValidatePreambleMapsToMaxTokens(t *testing.T) {
+	raw := `binary{"content":"根据 CLAUDE.md 中的项目地图，这是一个 StarRocks AIOps 统一工作区，包含 14 个协作项目。让我快速验证各模块的实际状态。"}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens for validation preamble; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_MarkdownHeadingFragmentMapsToMaxTokens(t *testing.T) {
+	raw := `binary{"content":"\n##"}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens for markdown heading fragment; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ShortOpusContinuationCommaMapsToMaxTokens(t *testing.T) {
+	raw := `binary{"content":"口，"}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens for short Opus comma continuation; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ContinuationAfterIncompleteAssistantSingleRuneMapsToMaxTokens(t *testing.T) {
+	raw := `binary{"content":"据"}`
+	reader := strings.NewReader(raw)
+	ctx := context.WithValue(context.Background(), kiroContinuationAfterIncompleteAssistantKey{}, true)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(ctx, reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens for single-rune continuation; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ContinuationAfterIncompleteAssistantFragmentMapsToMaxTokens(t *testing.T) {
+	raw := `binary{"content":"引擎解析执行计划 "}`
+	reader := strings.NewReader(raw)
+	ctx := context.WithValue(context.Background(), kiroContinuationAfterIncompleteAssistantKey{}, true)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(ctx, reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens for incomplete continuation fragment; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ClaudeCodeContinuationDoesNotMapToMaxTokens(t *testing.T) {
+	raw := `binary{"content":"引擎解析执行计划 "}`
+	reader := strings.NewReader(raw)
+	ctx := context.WithValue(context.Background(), kiroContinuationAfterIncompleteAssistantKey{}, true)
+	ctx = context.WithValue(ctx, kiroClaudeCodeRequestKey{}, true)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(ctx, reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "end_turn" {
+		t.Fatalf("stop_reason = %q, want end_turn for Claude Code continuation fragment; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_SynthesizesClosureForLongTruncatedSummary(t *testing.T) {
+	ctx := context.WithValue(context.Background(), kiroContinuationAfterIncompleteAssistantKey{}, true)
+	raw := `binary{"content":"- **starrocks-profile**：Profile解析\n- **starrocks-profile-mcp**：MCP工具\n- **starrocks-ops-mcp**：运维工具\n- **starrocks-profile-agent**：诊断Agent\n- **starrocks-aiops**：AIOps引擎\n- **starrocks-board**：Vue运维看板，逐步被aiops替"}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(ctx, reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	joined := strings.Join(stringifyLines(lines), "|")
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "end_turn" {
+		t.Fatalf("stop_reason = %q, want end_turn for synthesized closure; lines=%s", stopReason, joined)
+	}
+	if !strings.Contains(joined, "以上为工作区模块功能概览。") {
+		t.Fatalf("synthesized closure missing; lines=%s", joined)
+	}
+}
+
+func TestStreamKiroToClaudeSSE_UnclosedVisibleDelimiterMapsToMaxTokens(t *testing.T) {
+	raw := `binary{"content":"| **starrocks-experience-docs** | 运维实战笔记（查"}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens for unclosed visible delimiter; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_UnclosedVisibleCodeFenceMapsToMaxTokens(t *testing.T) {
+	raw := "binary{\"content\":\"数据流：\\n```\\n┌─ sta\"}"
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens for unclosed visible code fence; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_LongVisibleTextWithoutTerminalMapsToMaxTokens(t *testing.T) {
+	raw := `binary{"content":"探索完成，以下是各子项目的功能总结：\n\n**starrocks-profile-mcp** (Python/MCP)\nProfile 分析 MCP Server，暴露 14 个工"}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens for long visible text without terminal punctuation; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_CompleteTableRowCanEndTurn(t *testing.T) {
+	raw := `binary{"content":"| **starrocks-experience-docs** | 运维实战笔记 |"}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "end_turn" {
+		t.Fatalf("stop_reason = %q, want end_turn for complete table row; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_LightModelLongVisibleTextCanEndTurn(t *testing.T) {
+	raw := `binary{"content":"探索完成，以下是各子项目的功能总结：\n\n**starrocks-profile-mcp** (Python/MCP)\nProfile 分析 MCP Server，暴露 14 个工"}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-haiku-4-5-20251001", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+
+	var stopReason string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "end_turn" {
+		t.Fatalf("stop_reason = %q, want end_turn for light-model long visible text; lines=%s", stopReason, strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ThinkingTagsSplitAcrossEvents(t *testing.T) {
+	raw := `binary{"content":"<thinking"}` +
+		`binary{"content":">\nprivate reasoning</thinking"}` +
+		`binary{"content":">\n\nVisible answer."}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, err := streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v", err)
+	}
+	var visible, thinking string
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if delta := gjson.GetBytes(payload, "delta.text"); delta.Exists() {
+				visible += delta.String()
+			}
+			if delta := gjson.GetBytes(payload, "delta.thinking"); delta.Exists() {
+				thinking += delta.String()
+			}
+		}
+	}
+	if visible != "Visible answer." {
+		t.Fatalf("visible text = %q, want %q; lines=%s", visible, "Visible answer.", strings.Join(stringifyLines(lines), "|"))
+	}
+	if thinking != "private reasoning" {
+		t.Fatalf("thinking = %q, want private reasoning; lines=%s", thinking, strings.Join(stringifyLines(lines), "|"))
+	}
+	if strings.Contains(strings.Join(stringifyLines(lines), "|"), "<thinking") ||
+		strings.Contains(strings.Join(stringifyLines(lines), "|"), "</thinking") {
+		t.Fatalf("thinking tags leaked into SSE payload: %s", strings.Join(stringifyLines(lines), "|"))
+	}
+}
+
+func TestStreamKiroToClaudeSSE_InterleavedToolUseIDs(t *testing.T) {
+	raw := `binary{"name":"Bash","toolUseId":"tu-a","input":"{\"command\":\"echo", "stop":false}` +
+		`binary{"name":"Read","toolUseId":"tu-b","input":"{\"file_path\":\"/tmp/a\"}", "stop":true}` +
+		`binary{"input":" ok\"}", "toolUseId":"tu-a"}` +
+		`binary{"stop":true, "toolUseId":"tu-a"}`
+	reader := strings.NewReader(raw)
+	var lines [][]byte
+	_, _ = streamKiroToClaudeSSE(context.Background(), reader, nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+
+	type toolBlock struct {
+		name  string
+		input string
+	}
+	idxToID := map[int]string{}
+	blocks := map[string]toolBlock{}
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			switch gjson.GetBytes(payload, "type").String() {
+			case "content_block_start":
+				if gjson.GetBytes(payload, "content_block.type").String() == "tool_use" {
+					idx := int(gjson.GetBytes(payload, "index").Int())
+					id := gjson.GetBytes(payload, "content_block.id").String()
+					idxToID[idx] = id
+					blocks[id] = toolBlock{name: gjson.GetBytes(payload, "content_block.name").String()}
+				}
+			case "content_block_delta":
+				if gjson.GetBytes(payload, "delta.type").String() == "input_json_delta" {
+					idx := int(gjson.GetBytes(payload, "index").Int())
+					id := idxToID[idx]
+					block := blocks[id]
+					block.input += gjson.GetBytes(payload, "delta.partial_json").String()
+					blocks[id] = block
+				}
+			}
+		}
+	}
+
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 valid tool blocks, got %d: %s", len(blocks), strings.Join(stringifyLines(lines), "|"))
+	}
+	if got := blocks["tu-a"]; got.name != "Bash" || got.input != `{"command":"echo ok"}` {
+		t.Fatalf("tu-a mismatch: %+v", got)
+	}
+	if got := blocks["tu-b"]; got.name != "Read" || got.input != `{"file_path":"/tmp/a"}` {
+		t.Fatalf("tu-b mismatch: %+v", got)
+	}
+}
+
+func TestKiroShouldGateLightModel(t *testing.T) {
+	if !kiroShouldGateLightModel("claude-haiku-4-5") {
+		t.Fatal("expected explicit Haiku alias to be gated")
+	}
+	if !kiroShouldGateLightModel("claude-haiku-4-5-20251001") {
+		t.Fatal("dated Claude Code auto-route alias maps to Sonnet and must be gated")
+	}
+	if !kiroShouldGateLightModel("claude-sonnet-4-6") {
+		t.Fatal("Sonnet requests must be gated")
+	}
+	if kiroShouldGateLightModel("claude-opus-4-6") {
+		t.Fatal("Opus main requests must not be gated")
+	}
+}
+
+func TestKiroModelGateLimit(t *testing.T) {
+	tests := []struct {
+		model string
+		want  int
+	}{
+		{"claude-haiku-4-5", kiroHaikuMaxConcurrentPerAuth},
+		{"claude-haiku-4-5-20251001", kiroSonnetMaxConcurrentPerAuth},
+		{"claude-sonnet-4-6", kiroSonnetMaxConcurrentPerAuth},
+		{"claude-sonnet-4-5", kiroSonnetMaxConcurrentPerAuth},
+		{"claude-opus-4-6", 0},
+	}
+	for _, tt := range tests {
+		got := kiroModelGateLimit(helps.MapKiroModel(tt.model))
+		if got != tt.want {
+			t.Fatalf("kiroModelGateLimit(MapKiroModel(%q)) = %d, want %d", tt.model, got, tt.want)
+		}
+	}
+}
+
+func TestKiroAutoRoutedDatedHaikuUsesSonnetUpstream(t *testing.T) {
+	body := []byte(`{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"hi"}]}`)
+	cwReq, _, err := buildKiroCodeWhispererRequest(body, nil, "")
+	if err != nil {
+		t.Fatalf("buildKiroCodeWhispererRequest error: %v", err)
+	}
+	got := gjson.GetBytes(cwReq, "conversationState.currentMessage.userInputMessage.modelId").String()
+	if got != "claude-sonnet-4.6" {
+		t.Fatalf("dated Haiku auto-route modelId = %q, want claude-sonnet-4.6", got)
+	}
+}
+
+func stringifyLines(lines [][]byte) []string {
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		out = append(out, string(l))
+	}
+	return out
+}
+
 // chunkedReader delivers data in small pieces to simulate a streaming HTTP response.
 type chunkedReader struct {
 	chunks []string
@@ -453,6 +1312,36 @@ func TestStreamKiroToClaudeSSE_MalformedAfterPayloadStillCompletes(t *testing.T)
 	}
 	if !strings.Contains(joined, "message_stop") {
 		t.Fatalf("stream should emit terminal success events after trailing malformed residue: %s", joined)
+	}
+}
+
+func TestStreamKiroToClaudeSSE_ClaudeCodeMalformedAfterPayloadSynthesizesClosure(t *testing.T) {
+	ctx := context.WithValue(context.Background(), kiroClaudeCodeRequestKey{}, true)
+	var lines [][]byte
+	result, err := streamKiroToClaudeSSE(ctx, strings.NewReader(`binary{"content":"项目：starrocks-profile、starrocks-board、starrocks-cluster、starrocks-profile-mcp、starrocks-ops-mcp、starrocks-aiops、starrocks-gc-detector。以上"}binary{"content":"oops"`), nil, "claude-opus-4-6", func(line []byte) {
+		lines = append(lines, append([]byte(nil), line...))
+	})
+	if err != nil {
+		t.Fatalf("streamKiroToClaudeSSE error = %v, want nil after payload started", err)
+	}
+	if !result.payloadStarted {
+		t.Fatalf("payloadStarted = false, want true")
+	}
+	var stopReason string
+	joined := strings.Join(stringifyLines(lines), "|")
+	for _, line := range lines {
+		for _, dl := range claudeSSEDataLines(line) {
+			payload := bytes.TrimSpace(bytes.TrimPrefix(dl, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "message_delta" {
+				stopReason = gjson.GetBytes(payload, "delta.stop_reason").String()
+			}
+		}
+	}
+	if stopReason != "end_turn" {
+		t.Fatalf("stop_reason = %q, want end_turn after synthesized closure; lines=%s", stopReason, joined)
+	}
+	if !strings.Contains(joined, "以上") || !strings.Contains(joined, "为工作区模块功能概览") {
+		t.Fatalf("synthesized closure missing from stream: %s", joined)
 	}
 }
 
@@ -687,6 +1576,568 @@ func TestKiroExecutorExecuteStreamPublishesFailureOnMalformedStream(t *testing.T
 	}
 }
 
+func TestKiroExecutorExecuteStreamRetriesThinkingOnlyBeforePayload(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		switch calls.Add(1) {
+		case 1:
+			_, _ = w.Write([]byte(`binary{"content":"<thinking>\nNeed one more attempt before answering.</thinking>"}` +
+				`binary{"content":"\n"}`))
+		case 2:
+			_, _ = w.Write([]byte(`binary{"content":"retry ok"}`))
+		default:
+			t.Fatalf("unexpected extra upstream call")
+		}
+	}))
+	defer server.Close()
+
+	origTemplate := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL
+	defer func() { helps.KiroBaseURLTemplate = origTemplate }()
+
+	executor := NewKiroExecutor(nil)
+	auth := &cliproxyauth.Auth{
+		ID:       "kiro-stream-retry-empty",
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken": "at-stream-retry",
+			"region":      "us-east-1",
+		},
+	}
+	payload := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":"hi"}]}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var got strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream chunk error after retry: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls.Load())
+	}
+	if !strings.Contains(got.String(), "retry ok") {
+		t.Fatalf("retry response was not streamed to client: %s", got.String())
+	}
+}
+
+func TestKiroExecutorExecuteStreamRetriesEmptyStreamBeforePayload(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		switch calls.Add(1) {
+		case 1, 2:
+			return
+		case 3:
+			_, _ = w.Write([]byte(`binary{"content":"empty stream retry ok"}`))
+		default:
+			t.Fatalf("unexpected extra upstream call")
+		}
+	}))
+	defer server.Close()
+
+	origTemplate := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL
+	defer func() { helps.KiroBaseURLTemplate = origTemplate }()
+
+	executor := NewKiroExecutor(nil)
+	auth := &cliproxyauth.Auth{
+		ID:       "kiro-stream-retry-empty-before-payload",
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken": "at-stream-retry-empty-before-payload",
+			"region":      "us-east-1",
+		},
+	}
+	payload := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":"hi"}],"output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var got strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream chunk error after retry: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("upstream calls = %d, want 3", calls.Load())
+	}
+	if !strings.Contains(got.String(), "empty stream retry ok") {
+		t.Fatalf("retry response was not streamed to client: %s", got.String())
+	}
+}
+
+func TestKiroExecutorExecuteStreamSynthesizesClaudeCodeTitleGeneration(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		t.Fatalf("title generation should not call Kiro upstream")
+	}))
+	defer server.Close()
+
+	origTemplate := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL
+	defer func() { helps.KiroBaseURLTemplate = origTemplate }()
+
+	executor := NewKiroExecutor(nil)
+	auth := &cliproxyauth.Auth{
+		ID:       "kiro-title-generation",
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken": "at-title-generation",
+			"region":      "us-east-1",
+		},
+	}
+	payload := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":[{"type":"text","text":"<session>\nExplore workspace modules\n</session>"}]}],"system":[{"type":"text","text":"Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. Return JSON with a single \"title\" field."}],"tools":[],"max_tokens":64000,"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}},"stream":true}`)
+	headers := http.Header{}
+	headers.Set("X-Anthropic-Billing-Header", "cc_version=2.1.143.657; cc_entrypoint=sdk-cli")
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Headers:      headers,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var got strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream chunk error: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("upstream calls = %d, want 0", calls.Load())
+	}
+	out := got.String()
+	if !strings.Contains(out, "event: message_start") || !strings.Contains(out, "event: message_stop") {
+		t.Fatalf("synthetic title stream is missing Claude SSE events: %s", out)
+	}
+	if !strings.Contains(out, `{\"title\":\"Explore workspace modules\"}`) {
+		t.Fatalf("synthetic title stream is missing title JSON: %s", out)
+	}
+}
+
+func TestKiroExecutorExecuteStreamSynthesizesClaudeCodeTitleGenerationFromSystemBilling(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		t.Fatalf("title generation should not call Kiro upstream")
+	}))
+	defer server.Close()
+
+	origTemplate := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL
+	defer func() { helps.KiroBaseURLTemplate = origTemplate }()
+
+	executor := NewKiroExecutor(nil)
+	auth := &cliproxyauth.Auth{
+		ID:       "kiro-title-generation-system-billing",
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken": "at-title-generation-system-billing",
+			"region":      "us-east-1",
+		},
+	}
+	payload := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":[{"type":"text","text":"<session>\nExplore workspace modules\n</session>"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.143.657; cc_entrypoint=sdk-cli; cch=03299;"},{"type":"text","text":"Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. Return JSON with a single \"title\" field."}],"tools":[],"max_tokens":64000,"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}},"stream":true}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream chunk error: %v", chunk.Err)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("upstream calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestLooksLikeClaudeCodeRequestDetectsToolSet(t *testing.T) {
+	body := []byte(`{"tools":[{"name":"Bash"},{"name":"Read"}]}`)
+	if !looksLikeClaudeCodeRequest(body, nil) {
+		t.Fatal("looksLikeClaudeCodeRequest = false, want true for Claude Code tool set")
+	}
+}
+
+func TestKiroExecutorExecuteStreamRetrySuppressesThinkingAfterMalformedBeforePayload(t *testing.T) {
+	var calls atomic.Int32
+	var bodiesMu sync.Mutex
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll request body: %v", err)
+		}
+		bodiesMu.Lock()
+		bodies = append(bodies, string(raw))
+		bodiesMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		switch calls.Add(1) {
+		case 1:
+			_, _ = w.Write([]byte(`binary{"content":"oops"`))
+		case 2:
+			_, _ = w.Write([]byte(`binary{"content":"retry without thinking ok"}`))
+		default:
+			t.Fatalf("unexpected extra upstream call")
+		}
+	}))
+	defer server.Close()
+
+	origTemplate := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL
+	defer func() { helps.KiroBaseURLTemplate = origTemplate }()
+
+	executor := NewKiroExecutor(nil)
+	auth := &cliproxyauth.Auth{
+		ID:       "kiro-stream-retry-no-thinking",
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken": "at-stream-retry-no-thinking",
+			"region":      "us-east-1",
+		},
+	}
+	payload := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":31999}}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var got strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream chunk error after retry: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls.Load())
+	}
+	if !strings.Contains(got.String(), "retry without thinking ok") {
+		t.Fatalf("retry response was not streamed to client: %s", got.String())
+	}
+
+	bodiesMu.Lock()
+	defer bodiesMu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("captured request bodies = %d, want 2", len(bodies))
+	}
+	if strings.Contains(bodies[0], "thinking_mode") || strings.Contains(bodies[0], "thinking_effort") || strings.Contains(bodies[0], "max_thinking_length") {
+		t.Fatalf("first Opus streaming request must suppress thinking to avoid hidden-thinking stalls; body=%s", bodies[0])
+	}
+	if strings.Contains(bodies[1], "thinking_mode") || strings.Contains(bodies[1], "thinking_effort") || strings.Contains(bodies[1], "max_thinking_length") {
+		t.Fatalf("retry request must suppress thinking to avoid another hidden-thinking stall; body=%s", bodies[1])
+	}
+}
+
+func TestKiroExecutorExecuteStreamSuppressesThinkingForClaudeCodeTools(t *testing.T) {
+	var captured string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll request body: %v", err)
+		}
+		captured = string(raw)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte(`binary{"content":"tool-ready answer"}`))
+	}))
+	defer server.Close()
+
+	origTemplate := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL
+	defer func() { helps.KiroBaseURLTemplate = origTemplate }()
+
+	executor := NewKiroExecutor(nil)
+	auth := &cliproxyauth.Auth{
+		ID:       "kiro-claude-code-no-thinking",
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken": "at-claude-code-no-thinking",
+			"region":      "us-east-1",
+		},
+	}
+	payload := []byte(`{
+		"model":"claude-opus-4-6",
+		"messages":[{"role":"user","content":"explore"}],
+		"thinking":{"type":"enabled","budget_tokens":31999},
+		"tools":[
+			{"name":"Agent","description":"Run a subagent","input_schema":{"type":"object","properties":{"prompt":{"type":"string"}}}},
+			{"name":"Bash","description":"Run shell","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}
+		]
+	}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream chunk error: %v", chunk.Err)
+		}
+	}
+	if strings.Contains(captured, "thinking_mode") || strings.Contains(captured, "thinking_effort") || strings.Contains(captured, "max_thinking_length") {
+		t.Fatalf("Claude Code tool request must suppress thinking to avoid hidden-thinking stalls; body=%s", captured)
+	}
+	if !strings.Contains(captured, "after using tools always provide the completed summary") {
+		t.Fatalf("Claude Code guidance was not attached to Kiro request; body=%s", captured)
+	}
+}
+
+func TestKiroExecutorExecuteStreamSuppressesThinkingForClaudeCodeHeader(t *testing.T) {
+	var captured string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll request body: %v", err)
+		}
+		captured = string(raw)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte(`binary{"content":"header-detected answer"}`))
+	}))
+	defer server.Close()
+
+	origTemplate := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL
+	defer func() { helps.KiroBaseURLTemplate = origTemplate }()
+
+	executor := NewKiroExecutor(nil)
+	auth := &cliproxyauth.Auth{
+		ID:       "kiro-claude-code-header",
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken": "at-claude-code-header",
+			"region":      "us-east-1",
+		},
+	}
+	payload := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":"explore"}],"thinking":{"type":"enabled","budget_tokens":31999}}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Headers: http.Header{
+			"X-Anthropic-Billing-Header": []string{"cc_version=2.1.119; cc_entrypoint=sdk-cli"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream chunk error: %v", chunk.Err)
+		}
+	}
+	if strings.Contains(captured, "thinking_mode") || strings.Contains(captured, "thinking_effort") || strings.Contains(captured, "max_thinking_length") {
+		t.Fatalf("Claude Code header request must suppress thinking; body=%s", captured)
+	}
+	if !strings.Contains(captured, "after using tools always provide the completed summary") {
+		t.Fatalf("Claude Code header guidance was not attached; body=%s", captured)
+	}
+}
+
+func TestKiroExecutorExecuteStreamAddsContinuationGuidanceForIncompleteTail(t *testing.T) {
+	var captured string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll request body: %v", err)
+		}
+		captured = string(raw)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte(`binary{"content":"finish."}`))
+	}))
+	defer server.Close()
+
+	origTemplate := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL
+	defer func() { helps.KiroBaseURLTemplate = origTemplate }()
+
+	executor := NewKiroExecutor(nil)
+	auth := &cliproxyauth.Auth{
+		ID:       "kiro-continuation-guidance",
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken": "at-continuation-guidance",
+			"region":      "us-east-1",
+		},
+	}
+	payload := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"assistant","content":"- **starrocks-board**：Vue"},{"role":"user","content":[{"type":"text","text":"continue"}]}],"thinking":{"type":"enabled","budget_tokens":31999}}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream chunk error: %v", chunk.Err)
+		}
+	}
+	if !strings.Contains(captured, "Continuation mode: the previous assistant message was truncated") {
+		t.Fatalf("continuation guidance was not attached; body=%s", captured)
+	}
+}
+
+func TestLooksLikeClaudeCodeKiroRequestRecognizesTaskTools(t *testing.T) {
+	tools := gjson.Parse(`[
+		{"name":"Task","description":"Launch a subagent"},
+		{"name":"AskUserQuestion","description":"Ask the user"}
+	]`)
+	if !looksLikeClaudeCodeKiroRequest(tools) {
+		t.Fatalf("expected Claude Code Task tools to be recognized")
+	}
+}
+
+func TestKiroExecutorExecuteStreamRetriesMultipleMalformedBeforePayload(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if calls.Add(1) <= 2 {
+			_, _ = w.Write([]byte(`binary{"content":"oops"`))
+			return
+		}
+		_, _ = w.Write([]byte(`binary{"content":"retry eventually ok"}`))
+	}))
+	defer server.Close()
+
+	origTemplate := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL
+	defer func() { helps.KiroBaseURLTemplate = origTemplate }()
+
+	executor := NewKiroExecutor(nil)
+	auth := &cliproxyauth.Auth{
+		ID:       "kiro-stream-retry-multiple-malformed",
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken": "at-stream-retry-multiple",
+			"region":      "us-east-1",
+		},
+	}
+	payload := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":"hi"}]}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var got strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream chunk error after retries: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("upstream calls = %d, want 3", calls.Load())
+	}
+	if !strings.Contains(got.String(), "retry eventually ok") {
+		t.Fatalf("retry response was not streamed to client: %s", got.String())
+	}
+}
+
+func TestKiroExecutorExecuteStreamRetriesClaudeCodeIntentionPreambleWithInvalidToolBeforePayload(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if calls.Add(1) == 1 {
+			_, _ = w.Write([]byte(`binary{"content":"我"}` +
+				`binary{"content":"来探索工作区的各个子项目模块。"}` +
+				`binary{"name":"Agent","toolUseId":"bad-agent","input":"{\"prompt\":\"read project","stop":false}`))
+			return
+		}
+		_, _ = w.Write([]byte(`binary{"content":"已完成模块梳理。"}`))
+	}))
+	defer server.Close()
+
+	origTemplate := helps.KiroBaseURLTemplate
+	helps.KiroBaseURLTemplate = server.URL
+	defer func() { helps.KiroBaseURLTemplate = origTemplate }()
+
+	executor := NewKiroExecutor(nil)
+	auth := &cliproxyauth.Auth{
+		ID:       "kiro-stream-retry-intention-invalid-tool",
+		Provider: "kiro",
+		Metadata: map[string]any{
+			"accessToken": "at-stream-retry-intention",
+			"region":      "us-east-1",
+		},
+	}
+	payload := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":"explore"}],"thinking":{"type":"enabled","budget_tokens":31999}}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Headers: http.Header{
+			"X-Anthropic-Billing-Header": []string{"cc_version=2.1.143; cc_entrypoint=sdk-cli"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var got strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream chunk error after retry: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls.Load())
+	}
+	if !strings.Contains(got.String(), "已完成模块梳理") {
+		t.Fatalf("retry response was not streamed to client: %s", got.String())
+	}
+	if strings.Contains(got.String(), "我来探索") {
+		t.Fatalf("intention-only preamble leaked to client: %s", got.String())
+	}
+}
+
 func TestKiroExecutorCountTokensKeepsUnsupported(t *testing.T) {
 	executor := NewKiroExecutor(nil)
 	_, err := executor.CountTokens(context.Background(), nil, cliproxyexecutor.Request{Model: "claude-sonnet-4-5"}, cliproxyexecutor.Options{})
@@ -717,13 +2168,22 @@ func TestKiroThinkingPipelineIntegration(t *testing.T) {
 		wantMaxBudget      int // if >0, assert budget_tokens <= this value
 		wantThinkingPrefix bool
 	}{
+		// NOTE: cases targeting `claude-sonnet-4-5` exercise the pipeline's
+		// kiro-specific budget clamp (the kiro registry entry caps thinking
+		// at 24576). The executor's tier policy
+		// (TestKiroEnabledOnLighterTierDropsThinking) then suppresses the
+		// generated prefix on those lighter tiers, so wantThinkingPrefix is
+		// false even when wantThinkingType=="enabled". Cases targeting
+		// `claude-sonnet-4-6` (which supports adaptive levels) exercise the
+		// `enabled+budget → adaptive+effort` rewrite and keep
+		// wantThinkingPrefix=true.
 		{
-			name:               "suffix budget override",
+			name:               "suffix budget override clamps and suppresses on lighter tier",
 			model:              "claude-sonnet-4-5(8192)",
 			body:               `{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`,
 			wantThinkingType:   "enabled",
 			wantBudgetTokens:   8192,
-			wantThinkingPrefix: true,
+			wantThinkingPrefix: false,
 		},
 		{
 			name:               "suffix none disables thinking",
@@ -734,20 +2194,20 @@ func TestKiroThinkingPipelineIntegration(t *testing.T) {
 			wantThinkingPrefix: false,
 		},
 		{
-			name:               "body thinking config passthrough",
-			model:              "claude-sonnet-4-5",
-			body:               `{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":4096}}`,
+			name:               "body enabled+budget on supports-levels tier rewrites to adaptive",
+			model:              "claude-sonnet-4-6",
+			body:               `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":4096}}`,
 			wantThinkingType:   "enabled",
 			wantBudgetTokens:   4096,
 			wantThinkingPrefix: true,
 		},
 		{
-			name:               "claude code default budget clamps to kiro max",
+			name:               "claude code default budget clamps to kiro max (lighter tier suppresses)",
 			model:              "claude-sonnet-4-5",
 			body:               `{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":31999}}`,
 			wantThinkingType:   "enabled",
 			wantMaxBudget:      24576,
-			wantThinkingPrefix: true,
+			wantThinkingPrefix: false,
 		},
 		{
 			name:               "no thinking config passthrough",
@@ -757,17 +2217,17 @@ func TestKiroThinkingPipelineIntegration(t *testing.T) {
 			wantThinkingPrefix: false,
 		},
 		{
-			name:               "budget clamped to model max",
+			name:               "budget clamped to model max (lighter tier suppresses)",
 			model:              "claude-sonnet-4-5(99999)",
 			body:               `{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`,
 			wantThinkingType:   "enabled",
 			wantMaxBudget:      24576,
-			wantThinkingPrefix: true,
+			wantThinkingPrefix: false,
 		},
 		{
-			name:               "suffix auto enables thinking",
-			model:              "claude-sonnet-4-5(auto)",
-			body:               `{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`,
+			name:               "suffix auto enables thinking on supports-levels tier",
+			model:              "claude-sonnet-4-6(auto)",
+			body:               `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}`,
 			wantThinkingType:   "enabled",
 			wantThinkingPrefix: true,
 		},
@@ -869,9 +2329,10 @@ func TestBuildClaudeMessageJSON_SameToolUseID_MultiEvent(t *testing.T) {
 }
 
 // TestStreamKiroToClaudeSSE_SameToolUseID_MultiEvent verifies that multiple
-// toolUse events with the same toolUseID emit only one content_block_start,
-// multiple input_json_delta events preserving the original shards, and exactly
-// one content_block_stop.
+// toolUse events with the same toolUseID emit only one content_block_start, one
+// valid accumulated input_json_delta, and exactly one content_block_stop. The
+// executor buffers Kiro tool input shards until they form complete JSON so
+// Claude Code never executes a half-written tool input as `{}`.
 func TestStreamKiroToClaudeSSE_SameToolUseID_MultiEvent(t *testing.T) {
 	raw := `{"content": "Let me check."}` +
 		`binary{"name": "get_weather", "toolUseId": "tu-dup", "input": "{\"loc\":", "stop": false}` +
@@ -900,11 +2361,10 @@ func TestStreamKiroToClaudeSSE_SameToolUseID_MultiEvent(t *testing.T) {
 	if toolStarts != 1 {
 		t.Errorf("expected exactly 1 tool_use content_block_start, got %d", toolStarts)
 	}
-	if inputDeltas < 2 {
-		t.Errorf("expected at least 2 input_json_delta events (one per shard), got %d", inputDeltas)
+	if inputDeltas != 1 {
+		t.Errorf("expected exactly 1 accumulated input_json_delta event, got %d", inputDeltas)
 	}
-	// Verify the first shard is emitted on the initial toolUse event, and the
-	// second shard on the continuation event.
+	// Verify both upstream shards were preserved inside the accumulated delta.
 	var shards []string
 	for _, s := range lines {
 		if strings.Contains(s, "input_json_delta") {
@@ -915,14 +2375,14 @@ func TestStreamKiroToClaudeSSE_SameToolUseID_MultiEvent(t *testing.T) {
 			}
 		}
 	}
-	if len(shards) < 2 {
-		t.Fatalf("expected at least 2 input_json_delta shards, got %d", len(shards))
+	if len(shards) != 1 {
+		t.Fatalf("expected exactly 1 input_json_delta shard, got %d", len(shards))
 	}
 	if !strings.Contains(shards[0], `loc`) {
-		t.Errorf("first shard should contain initial input fragment, got: %s", shards[0])
+		t.Errorf("accumulated shard should contain initial input fragment, got: %s", shards[0])
 	}
-	if !strings.Contains(shards[1], `NYC`) {
-		t.Errorf("second shard should contain continuation input, got: %s", shards[1])
+	if !strings.Contains(shards[0], `NYC`) {
+		t.Errorf("accumulated shard should contain continuation input, got: %s", shards[0])
 	}
 }
 
@@ -1370,6 +2830,107 @@ func TestKiroEnabledBudgetRewriteToAdaptive(t *testing.T) {
 				}
 			default:
 				t.Fatalf("unsupported wantMode %q", tt.wantMode)
+			}
+		})
+	}
+}
+
+// TestKiroEnabledOnLighterTierDropsThinking guards the tier-aware policy in
+// buildKiroCodeWhispererRequest: Claude Code's default `enabled+budget`
+// thinking shape must be SUPPRESSED entirely on lighter Kiro tiers
+// (haiku 4.5, sonnet 4.5, opus 4.5) that do not understand
+// <thinking_mode>adaptive</thinking_mode>+<thinking_effort>...</thinking_effort>.
+//
+// Without this policy the proxy's default `enabled+budget → adaptive+medium`
+// rewrite would still fire on lighter tiers, sending an upstream-ignored
+// adaptive prefix and adding latency to Claude Code's auto-routed light-tier
+// traffic (completion summary, telemetry, internal subagent calls).
+//
+// Heavier tiers (sonnet 4.6, opus 4.6, opus 4.7) must still receive the
+// rewrite, since that is where the fluency bug being mitigated lives.
+func TestKiroEnabledOnLighterTierDropsThinking(t *testing.T) {
+	tests := []struct {
+		name           string
+		model          string
+		thinkingJSON   string
+		wantPrefix     bool
+		mustContain    string
+		mustNotContain []string
+	}{
+		{
+			name:           "haiku-4-5 enabled+budget: thinking suppressed",
+			model:          "claude-haiku-4-5",
+			thinkingJSON:   `{"type":"enabled","budget_tokens":31999}`,
+			wantPrefix:     false,
+			mustNotContain: []string{"thinking_mode", "thinking_effort", "max_thinking_length"},
+		},
+		{
+			name:         "haiku dated auto-route alias enabled+budget: upgraded to sonnet adaptive",
+			model:        "claude-haiku-4-5-20251001",
+			thinkingJSON: `{"type":"enabled","budget_tokens":31999}`,
+			wantPrefix:   true,
+			mustContain:  "<thinking_mode>adaptive</thinking_mode>",
+		},
+		{
+			name:           "sonnet-4-5 enabled+budget: thinking suppressed",
+			model:          "claude-sonnet-4-5",
+			thinkingJSON:   `{"type":"enabled","budget_tokens":31999}`,
+			wantPrefix:     false,
+			mustNotContain: []string{"thinking_mode", "thinking_effort", "max_thinking_length"},
+		},
+		{
+			name:           "opus-4-5 enabled+budget: thinking suppressed",
+			model:          "claude-opus-4-5",
+			thinkingJSON:   `{"type":"enabled","budget_tokens":31999}`,
+			wantPrefix:     false,
+			mustNotContain: []string{"thinking_mode", "thinking_effort", "max_thinking_length"},
+		},
+		{
+			name:         "sonnet-4-6 (supports levels) enabled+budget: still rewritten to adaptive+medium",
+			model:        "claude-sonnet-4-6",
+			thinkingJSON: `{"type":"enabled","budget_tokens":31999}`,
+			wantPrefix:   true,
+			mustContain:  "<thinking_mode>adaptive</thinking_mode>",
+		},
+		{
+			name:         "opus-4-6 (supports levels) enabled+budget: still rewritten to adaptive+medium",
+			model:        "claude-opus-4-6",
+			thinkingJSON: `{"type":"enabled","budget_tokens":31999}`,
+			wantPrefix:   true,
+			mustContain:  "<thinking_mode>adaptive</thinking_mode>",
+		},
+		{
+			// Explicit adaptive must still pass through on lighter tiers, so
+			// callers that opt in deliberately are not silently dropped.
+			name:         "haiku explicit adaptive: prefix preserved",
+			model:        "claude-haiku-4-5",
+			thinkingJSON: `{"type":"adaptive"}`,
+			wantPrefix:   true,
+			mustContain:  "<thinking_mode>adaptive</thinking_mode>",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(
+				`{"model":%q,"messages":[{"role":"user","content":"hi"}],"thinking":%s}`,
+				tt.model, tt.thinkingJSON,
+			))
+			cwReq, _, err := buildKiroCodeWhispererRequest(body, nil, "medium")
+			if err != nil {
+				t.Fatalf("buildKiroCodeWhispererRequest error: %v", err)
+			}
+			content := gjson.GetBytes(cwReq, "conversationState.currentMessage.userInputMessage.content").String()
+
+			for _, forbid := range tt.mustNotContain {
+				if strings.Contains(content, forbid) {
+					t.Errorf("content must not contain %q; got %q", forbid, content)
+				}
+			}
+			if tt.wantPrefix {
+				if tt.mustContain != "" && !strings.Contains(content, tt.mustContain) {
+					t.Errorf("content must contain %q; got %q", tt.mustContain, content)
+				}
 			}
 		})
 	}

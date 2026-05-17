@@ -205,10 +205,12 @@ func (h *Handler) ResetCodexQueueAuth(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"ok": false, "changed": 0})
 			return
 		}
+		coordinator.ReconcileNow(c.Request.Context())
 		c.JSON(http.StatusOK, gin.H{"ok": true, "changed": 1})
 		return
 	}
 	count := coordinator.ResetGroup(groupKey)
+	coordinator.ReconcileNow(c.Request.Context())
 	c.JSON(http.StatusOK, gin.H{"ok": count > 0, "changed": count})
 }
 

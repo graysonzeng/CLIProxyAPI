@@ -237,6 +237,27 @@ func (s *authScheduler) removeAuth(authID string) {
 }
 
 // pickSingle returns the next auth for a single provider/model request using scheduler state.
+// pickSingle picks the next eligible auth for a single-provider request.
+//
+// Locking note: this function takes s.mu (a sync.Mutex, not RWMutex), so
+// concurrent picks across goroutines serialize here. This was investigated
+// in detail when chasing a ~325-433ms TTFT spread observed on 4-way
+// concurrent Kiro haiku fan-outs. Findings:
+//
+//  1. Hold time is microseconds — map lookup + predicate evaluation only,
+//     no I/O. Even 8 concurrent picks add < 1ms total.
+//  2. The observed spread reproduces in a strictly SEQUENTIAL 4x baseline
+//     (no concurrency at all): TTFTs of 1451 / 872 / 1113 / 1355 ms,
+//     spread = 579ms. The spread is upstream-side variance from the AWS
+//     CodeWhisperer endpoint, not proxy-side serialization.
+//  3. As concurrency grows from 4 → 8, observed spread DECREASES
+//     (506 → 325 → 293 ms) because the sample averages out — the opposite
+//     of what a proxy-internal bottleneck would produce.
+//
+// Do not refactor this Mutex into an RWMutex / lock-free structure for
+// "concurrency wins" without first re-measuring with a sequential baseline
+// to disambiguate from upstream variance. See git history for the probe
+// methodology (kiro_spread_probe.py).
 func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, error) {
 	if s == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}

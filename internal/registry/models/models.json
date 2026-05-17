@@ -2105,6 +2105,21 @@
       }
     },
     {
+      "id": "claude-haiku-4-5-20251001",
+      "object": "model",
+      "created": 1759276800,
+      "owned_by": "kiro",
+      "type": "kiro",
+      "display_name": "Claude 4.5 Haiku (Kiro, 20251001)",
+      "context_length": 200000,
+      "max_completion_tokens": 64000,
+      "thinking": {
+        "min": 1024,
+        "max": 24576,
+        "zero_allowed": true
+      }
+    },
+    {
       "id": "claude-opus-4-5",
       "object": "model",
       "created": 1759104000,

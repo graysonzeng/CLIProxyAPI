@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,112 @@ import (
 )
 
 var authProviderWarmupRetryInterval = 5 * time.Second
+
+// providersWithDefaultWarmup lists providers that get an auto-injected
+// warmup entry whenever the operator enabled the warmup feature but did not
+// explicitly configure that provider, AND the auth manager has at least one
+// healthy auth for that provider registered.
+//
+// The auto-injection serves two goals:
+//  1. Warm the provider executor's shared HTTP client connection pool at
+//     server start (kills the ~800ms cold-handshake tax on the first user
+//     request after a restart — measured for Kiro on a us-east-1 endpoint).
+//  2. Hold the connection alive across long idle gaps via the periodic
+//     warmup interval (default 1h, with jitter), so users coming back to a
+//     quiet proxy do not pay the cold tax either.
+//
+// Operators can override by listing the provider explicitly in
+// auth-provider-warmup.providers (their entry takes precedence and the
+// default is suppressed). Disabling the whole feature
+// (auth-provider-warmup.enabled=false) suppresses auto-injection too — the
+// startup ping is conceptually part of the same warmup contract, so a single
+// switch controls both.
+//
+// The map value is the model to ping for that provider. Use Sonnet for Kiro
+// because Haiku's tool-use stream has produced incomplete input shards during
+// Claude Code auto-routing and should not be used by default background paths.
+// Adding a new provider here is opt-in: other providers (anthropic, gemini,
+// openai-compat, etc.) currently rely on the operator's explicit config.
+var providersWithDefaultWarmup = map[string]string{
+	"kiro": "claude-sonnet-4-6",
+}
+
+// appendDefaultWarmupProviders augments the operator's warmup config with
+// per-provider defaults for any provider listed in
+// providersWithDefaultWarmup that has at least one healthy auth registered
+// but no explicit entry in the operator config.
+//
+// Returns the cfg unchanged when:
+//   - cfg.Enabled is false (operator disabled the whole feature),
+//   - manager is nil (no auth manager available, e.g. early bootstrap),
+//   - the operator already configured every default provider explicitly,
+//   - none of the default providers have a healthy auth registered.
+//
+// The returned config is a shallow copy when augmented; the caller may pass
+// it to update() without affecting the operator's source config struct.
+func appendDefaultWarmupProviders(cfg internalconfig.AuthProviderWarmupConfig, manager *coreauth.Manager) internalconfig.AuthProviderWarmupConfig {
+	if !cfg.Enabled || manager == nil {
+		return cfg
+	}
+
+	have := make(map[string]struct{}, len(cfg.Providers))
+	for _, p := range cfg.Providers {
+		key := strings.ToLower(strings.TrimSpace(p.Provider))
+		if key == "" {
+			continue
+		}
+		have[key] = struct{}{}
+	}
+
+	activeProviders := make(map[string]struct{})
+	for _, auth := range manager.List() {
+		if auth == nil || auth.Status != coreauth.StatusActive {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(auth.Provider))
+		if key == "" {
+			continue
+		}
+		activeProviders[key] = struct{}{}
+	}
+
+	// Stable iteration order so the appended entries are deterministic
+	// across server restarts (helps log readability and test assertions).
+	added := false
+	augmented := cfg
+	for _, provider := range sortedKeys(providersWithDefaultWarmup) {
+		if _, ok := have[provider]; ok {
+			continue
+		}
+		if _, ok := activeProviders[provider]; !ok {
+			continue
+		}
+		if !added {
+			augmented.Providers = append([]internalconfig.WarmupProviderConfig(nil), cfg.Providers...)
+			added = true
+		}
+		augmented.Providers = append(augmented.Providers, internalconfig.WarmupProviderConfig{
+			Provider:              provider,
+			Model:                 providersWithDefaultWarmup[provider],
+			Enabled:               true,
+			SkipWhenQuotaExceeded: true,
+		})
+		log.WithFields(log.Fields{
+			"provider": provider,
+			"model":    providersWithDefaultWarmup[provider],
+		}).Debug("auth provider warmup: auto-injected default provider entry")
+	}
+	return augmented
+}
+
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
 
 type authProviderWarmupRunner struct {
 	service *Service
@@ -43,7 +150,11 @@ func (s *Service) applyAuthProviderWarmupConfig(newCfg *config.Config) {
 		s.warmupRunner.update(internalconfig.AuthProviderWarmupConfig{})
 		return
 	}
-	s.warmupRunner.update(newCfg.AuthProviderWarmup)
+	// Augment with per-provider defaults (e.g. kiro startup connection
+	// pool warm-up) before handing to the runner. The augmenter respects
+	// the operator's explicit provider list and only fills gaps.
+	augmented := appendDefaultWarmupProviders(newCfg.AuthProviderWarmup, s.coreManager)
+	s.warmupRunner.update(augmented)
 }
 
 func (s *Service) stopAuthProviderWarmup() {
@@ -205,35 +316,91 @@ func (r *authProviderWarmupRunner) runProvider(ctx context.Context, cfg internal
 		prompt = internalconfig.AuthProviderWarmupDefaultPrompt
 	}
 
-	refs := providerCfg.AuthIndexes
-	if len(refs) == 0 {
-		if _, err := r.executeWarmup(ctx, provider, model, prompt, nil); err != nil {
-			log.WithError(err).Warnf("auth provider warmup failed (provider=%s model=%s)", provider, model)
-			return false
-		}
-		log.Infof("auth provider warmup completed (provider=%s model=%s)", provider, model)
-		return true
+	auths := r.resolveWarmupAuths(provider, providerCfg)
+	if len(auths) == 0 {
+		log.Debugf("auth provider warmup: no eligible auth registered (provider=%s model=%s)", provider, model)
+		return false
 	}
 
 	succeeded := false
-	for _, ref := range refs {
-		auth := r.authByRef(ref)
+	for _, auth := range auths {
 		if auth == nil {
-			log.Warnf("auth provider warmup skipped missing auth ref (provider=%s model=%s)", provider, model)
 			continue
 		}
 		if providerCfg.SkipWhenQuotaExceeded && authHasKnownQuotaBlock(auth) {
-			log.Debugf("auth provider warmup skipped quota-blocked auth (provider=%s model=%s)", provider, model)
+			log.Debugf("auth provider warmup skipped quota-blocked auth (provider=%s model=%s auth=%s)", provider, model, auth.ID)
 			continue
 		}
 		if _, err := r.executeWarmup(ctx, provider, model, prompt, auth); err != nil {
-			log.WithError(err).Warnf("auth provider warmup failed (provider=%s model=%s)", provider, model)
+			log.WithError(err).Warnf("auth provider warmup failed (provider=%s model=%s auth=%s)", provider, model, auth.ID)
 			continue
 		}
-		log.Infof("auth provider warmup completed (provider=%s model=%s)", provider, model)
+		log.Infof("auth provider warmup completed (provider=%s model=%s auth=%s)", provider, model, auth.ID)
 		succeeded = true
 	}
 	return succeeded
+}
+
+// resolveWarmupAuths returns the auths to warm for one provider/cycle.
+//
+// When the operator listed explicit auth refs in providerCfg.AuthIndexes the
+// resolver honors that exact list (intentional pinning, e.g. paid vs free
+// account selection).
+//
+// When the operator left auth-indexes empty the resolver enumerates EVERY
+// healthy auth registered for that provider so multi-account setups
+// (codex queue rotation, multiple kiro accounts, an Anthropic key pool,
+// etc.) keep both the active and the candidate accounts warm. Without this
+// pass the proxy would only warm the currently active candidate, so
+// fail-over to a queued account paid the ~800ms cold-handshake tax on the
+// first request and could surface as visible latency in Claude Code.
+//
+// The returned auths are clones of the manager state. Quota gating is
+// applied by the caller via authHasKnownQuotaBlock so the operator's
+// SkipWhenQuotaExceeded flag still wins.
+func (r *authProviderWarmupRunner) resolveWarmupAuths(provider string, providerCfg internalconfig.WarmupProviderConfig) []*coreauth.Auth {
+	if r == nil || r.service == nil || r.service.coreManager == nil {
+		return nil
+	}
+	if len(providerCfg.AuthIndexes) > 0 {
+		out := make([]*coreauth.Auth, 0, len(providerCfg.AuthIndexes))
+		for _, ref := range providerCfg.AuthIndexes {
+			auth := r.authByRef(ref)
+			if auth == nil {
+				log.Warnf("auth provider warmup: missing auth ref (provider=%s ref=%s)", provider, ref)
+				continue
+			}
+			out = append(out, auth)
+		}
+		return out
+	}
+	return r.healthyAuthsForProvider(provider)
+}
+
+// healthyAuthsForProvider returns clones of every healthy auth for the
+// given provider. Healthy = registered + not Disabled + Status==Active.
+// Quota gating is intentionally NOT done here so the caller can apply the
+// per-provider SkipWhenQuotaExceeded flag.
+func (r *authProviderWarmupRunner) healthyAuthsForProvider(provider string) []*coreauth.Auth {
+	target := strings.ToLower(strings.TrimSpace(provider))
+	if target == "" || r == nil || r.service == nil || r.service.coreManager == nil {
+		return nil
+	}
+	var out []*coreauth.Auth
+	for _, auth := range r.service.coreManager.List() {
+		if auth == nil || auth.Disabled {
+			continue
+		}
+		if auth.Status != coreauth.StatusActive {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), target) {
+			continue
+		}
+		auth.EnsureIndex()
+		out = append(out, auth)
+	}
+	return out
 }
 
 func (r *authProviderWarmupRunner) executeWarmup(ctx context.Context, provider, model, prompt string, pinned *coreauth.Auth) (string, error) {

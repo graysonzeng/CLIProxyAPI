@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -135,6 +136,10 @@ type authAwareStreamExecutor struct {
 	mu      sync.Mutex
 	calls   int
 	authIDs []string
+}
+
+type delayedFirstPayloadStreamExecutor struct {
+	delay time.Duration
 }
 
 type invalidJSONStreamExecutor struct{}
@@ -268,6 +273,92 @@ func (e *authAwareStreamExecutor) AuthIDs() []string {
 	out := make([]string, len(e.authIDs))
 	copy(out, e.authIDs)
 	return out
+}
+
+func (e *delayedFirstPayloadStreamExecutor) Identifier() string { return "codex" }
+
+func (e *delayedFirstPayloadStreamExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "Execute not implemented"}
+}
+
+func (e *delayedFirstPayloadStreamExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	_ = auth
+	_ = req
+	_ = opts
+	ch := make(chan coreexecutor.StreamChunk, 1)
+	go func() {
+		defer close(ch)
+		timer := time.NewTimer(e.delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			ch <- coreexecutor.StreamChunk{Err: ctx.Err()}
+		case <-timer.C:
+			ch <- coreexecutor.StreamChunk{Payload: []byte("ok")}
+		}
+	}()
+	return &coreexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func (e *delayedFirstPayloadStreamExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *delayedFirstPayloadStreamExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
+}
+
+func (e *delayedFirstPayloadStreamExecutor) HttpRequest(ctx context.Context, auth *coreauth.Auth, req *http.Request) (*http.Response, error) {
+	return nil, &coreauth.Error{
+		Code:       "not_implemented",
+		Message:    "HttpRequest not implemented",
+		HTTPStatus: http.StatusNotImplemented,
+	}
+}
+
+func TestExecuteStreamWithAuthManager_ReturnsBeforeFirstPayload(t *testing.T) {
+	executor := &delayedFirstPayloadStreamExecutor{delay: 250 * time.Millisecond}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{
+		ID:       "auth1",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"email": "test@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("manager.Register: %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	started := time.Now()
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
+	elapsed := time.Since(started)
+	if dataChan == nil || errChan == nil {
+		t.Fatalf("expected non-nil channels")
+	}
+	if elapsed >= 100*time.Millisecond {
+		t.Fatalf("ExecuteStreamWithAuthManager blocked for %s before first payload", elapsed)
+	}
+
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected error: %+v", msg)
+		}
+	}
+	if string(got) != "ok" {
+		t.Fatalf("payload = %q, want ok", got)
+	}
 }
 
 func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {

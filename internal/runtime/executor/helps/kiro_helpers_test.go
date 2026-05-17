@@ -106,7 +106,14 @@ func TestMapKiroModel(t *testing.T) {
 		expected string
 	}{
 		{"claude-sonnet-4-5", "claude-sonnet-4.5"},
+		{"claude-sonnet-4-5-20250929", "claude-sonnet-4.5"},
 		{"claude-haiku-4-5", "claude-haiku-4.5"},
+		// Claude Code's auto-routed light-tier traffic uses the dated Haiku
+		// form. Route it to Kiro Sonnet 4.6 instead of Kiro Haiku because Haiku
+		// has produced incomplete tool-use input shards under Claude Code.
+		{"claude-haiku-4-5-20251001", "claude-sonnet-4.6"},
+		{"claude-opus-4-5", "claude-opus-4.5"},
+		{"claude-opus-4-5-20251101", "claude-opus-4.5"},
 		{"claude-opus-4-7", "claude-opus-4.7"},
 		{"unknown-model", "unknown-model"},
 	}
@@ -114,6 +121,38 @@ func TestMapKiroModel(t *testing.T) {
 		result := MapKiroModel(tt.input)
 		if result != tt.expected {
 			t.Errorf("MapKiroModel(%q) = %q, want %q", tt.input, result, tt.expected)
+		}
+	}
+}
+
+// TestKiroSupportsAdaptiveLevels pins the tier policy used by
+// kiro_executor.buildKiroCodeWhispererRequest to skip the proxy's default
+// `enabled+budget → adaptive+effort` rewrite on lighter Kiro tiers. Adding a
+// new model that supports adaptive thinking levels requires updating both
+// kiroAdaptiveLevelsModels and this test.
+func TestKiroSupportsAdaptiveLevels(t *testing.T) {
+	tests := []struct {
+		upstreamModel string
+		want          bool
+	}{
+		{"claude-sonnet-4.6", true},
+		{"claude-opus-4.6", true},
+		{"claude-opus-4.7", true},
+		{"claude-haiku-4.5", false},
+		{"claude-sonnet-4.5", false},
+		{"claude-opus-4.5", false},
+		{"", false},
+		{"unknown-model", false},
+		// Mapping callers always pass the upstream id (returned by
+		// MapKiroModel). Surface clearly that client-facing aliases must
+		// be normalized first.
+		{"claude-haiku-4-5", false},
+		{"claude-sonnet-4-6", false},
+	}
+	for _, tt := range tests {
+		got := KiroSupportsAdaptiveLevels(tt.upstreamModel)
+		if got != tt.want {
+			t.Errorf("KiroSupportsAdaptiveLevels(%q) = %v, want %v", tt.upstreamModel, got, tt.want)
 		}
 	}
 }
@@ -214,6 +253,13 @@ func TestKiroSharedHTTPClient_ReusesSingletonAndConfiguresKeepAlive(t *testing.T
 	}
 	if tr.MaxIdleConnsPerHost <= 0 {
 		t.Errorf("MaxIdleConnsPerHost must be positive to enable keep-alive pooling, got %d", tr.MaxIdleConnsPerHost)
+	}
+	// Lowering MaxIdleConnsPerHost below 16 reintroduces a measurable p99
+	// TTFT outlier on Claude Code's 8x subagent fan-out (the transport is
+	// forced to dial a fresh TCP+TLS conn mid-burst). Keep this at >=16
+	// unless replaced by a different connection-pool strategy.
+	if tr.MaxIdleConnsPerHost < 16 {
+		t.Errorf("MaxIdleConnsPerHost must be >=16 for healthy 8x concurrent subagent fan-out, got %d", tr.MaxIdleConnsPerHost)
 	}
 	if tr.IdleConnTimeout <= 0 {
 		t.Errorf("IdleConnTimeout must be positive, got %v", tr.IdleConnTimeout)
@@ -464,8 +510,21 @@ func TestParseAwsEventStreamBuffer_ReturnsSubSliceOfInput(t *testing.T) {
 	}
 }
 
+func TestParseAwsEventStreamBuffer_ContentLengthExceededException(t *testing.T) {
+	events, remaining := ParseAwsEventStreamBuffer([]byte("binary-headers:exception-type\x00ContentLengthExceededException payload"))
+	if len(remaining) != 0 {
+		t.Fatalf("remaining = %q, want empty after complete exception frame", string(remaining))
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected one exception event, got %d", len(events))
+	}
+	if events[0].Type != "exception" || events[0].ExceptionType != "ContentLengthExceededException" {
+		t.Fatalf("unexpected event: %+v", events[0])
+	}
+}
+
 func TestParseAwsEventStreamBuffer_ToolUseStopEvent(t *testing.T) {
-	buffer := []byte(`{"stop": true}`)
+	buffer := []byte(`{"stop": true, "toolUseId": "tu-stop"}`)
 	events, _ := ParseAwsEventStreamBuffer(buffer)
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
@@ -475,6 +534,9 @@ func TestParseAwsEventStreamBuffer_ToolUseStopEvent(t *testing.T) {
 	}
 	if !events[0].ToolStop {
 		t.Error("expected stop=true")
+	}
+	if events[0].ToolUseID != "tu-stop" {
+		t.Errorf("expected toolUseId tu-stop, got %q", events[0].ToolUseID)
 	}
 }
 
@@ -623,6 +685,44 @@ func TestSanitizeToolInput_NoChange(t *testing.T) {
 	}
 }
 
+// TestSanitizeToolInput_EmptyDefaultsToObject pins the contract that
+// SanitizeToolInput substitutes an empty `{}` for nil / zero-length input.
+// Without this fallback, downstream code that embeds the result as a
+// json.RawMessage in a struct (such as buildKiroAssistantHistoryMessage)
+// would fail to marshal the surrounding payload because json.Marshal on an
+// empty json.RawMessage returns "unexpected end of JSON input". Empty inputs
+// can arise when a prior assistant turn was persisted by Claude Code with a
+// tool_use block whose `input` field was missing or null — historically a
+// possible outcome of the missing `input: {}` bug fixed in
+// streamKiroToClaudeSSE. The fallback keeps the proxy resilient against
+// poisoned conversation history regardless of what produced it.
+func TestSanitizeToolInput_EmptyDefaultsToObject(t *testing.T) {
+	cases := []struct {
+		name  string
+		input json.RawMessage
+	}{
+		{name: "nil input", input: nil},
+		{name: "zero-length input", input: json.RawMessage{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := SanitizeToolInput(tc.input)
+			if string(result) != "{}" {
+				t.Fatalf("expected empty input to default to %q, got %q", "{}", string(result))
+			}
+			// Must be safe to embed in another struct without
+			// json.Marshal returning an "unexpected end of JSON input"
+			// error.
+			wrapper := struct {
+				Input json.RawMessage `json:"input"`
+			}{Input: result}
+			if _, err := json.Marshal(wrapper); err != nil {
+				t.Fatalf("expected wrapped sanitized input to marshal, got error: %v", err)
+			}
+		})
+	}
+}
+
 // --- Kiro error classification tests ---
 
 func TestClassifyKiroHTTPStatus_KnownBuckets(t *testing.T) {
@@ -710,17 +810,33 @@ func TestClassifyKiroHTTPStatus_RetryAfterPastDateIgnored(t *testing.T) {
 	}
 }
 
-func TestClassifyKiroHTTPStatus_NonRateLimitedIgnoresRetryAfter(t *testing.T) {
+func TestClassifyKiroHTTPStatus_ServerRetryAfterSeconds(t *testing.T) {
 	header := http.Header{}
 	header.Set("Retry-After", "30")
-	ke := ClassifyKiroHTTPStatus(503, nil, header)
+	ke := ClassifyKiroHTTPStatus(524, []byte(`{"error":{"type":"origin_response_timeout","retry_after":120}}`), header)
 	if ke.Classification() != KiroErrServer {
 		t.Fatalf("Classification = %q, want %q", ke.Classification(), KiroErrServer)
 	}
-	// 5xx classifier intentionally does not surface Retry-After today;
-	// document the boundary so future change is intentional.
-	if ke.RetryAfter() != nil {
-		t.Fatalf("non-429 should not expose Retry-After in current contract; got %v", *ke.RetryAfter())
+	got := ke.RetryAfter()
+	if got == nil {
+		t.Fatalf("RetryAfter = nil, want 30s")
+	}
+	if *got != 30*time.Second {
+		t.Fatalf("RetryAfter = %v, want 30s", *got)
+	}
+}
+
+func TestClassifyKiroHTTPStatus_ServerRetryAfterBodyFallback(t *testing.T) {
+	ke := ClassifyKiroHTTPStatus(524, []byte(`{"error":{"type":"origin_response_timeout","retry_after":120}}`), nil)
+	if ke.Classification() != KiroErrServer {
+		t.Fatalf("Classification = %q, want %q", ke.Classification(), KiroErrServer)
+	}
+	got := ke.RetryAfter()
+	if got == nil {
+		t.Fatalf("RetryAfter = nil, want 120s")
+	}
+	if *got != 120*time.Second {
+		t.Fatalf("RetryAfter = %v, want 120s", *got)
 	}
 }
 

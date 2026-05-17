@@ -2163,7 +2163,7 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 		}
 		return wait, true
 	}
-	if status != http.StatusTooManyRequests {
+	if status != http.StatusTooManyRequests && status != http.StatusRequestTimeout && (status < 500 || status >= 600) {
 		return 0, false
 	}
 	if !m.retryAllowed(attempt, providers) {
@@ -2317,9 +2317,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								shouldSuspendModel = true
 								setModelQuota = true
 							}
-						case 408, 500, 502, 503, 504:
+						case 408, 500, 502, 503, 504, 520, 522, 523, 524:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
+							} else if result.RetryAfter != nil && *result.RetryAfter > 0 {
+								next := now.Add(*result.RetryAfter)
+								state.NextRetryAfter = next
 							} else {
 								next := now.Add(1 * time.Minute)
 								state.NextRetryAfter = next
@@ -2595,8 +2598,8 @@ func retryAfterFromError(err error) *time.Duration {
 	type retryAfterProvider interface {
 		RetryAfter() *time.Duration
 	}
-	rap, ok := err.(retryAfterProvider)
-	if !ok || rap == nil {
+	var rap retryAfterProvider
+	if !errors.As(err, &rap) || rap == nil {
 		return nil
 	}
 	retryAfter := rap.RetryAfter()

@@ -656,42 +656,42 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		Headers:         headersFromContext(ctx),
 	}
 	opts.Metadata = reqMeta
-	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
-	if err != nil {
-		err = enrichAuthSelectionError(err, providers, normalizedModel)
-		errChan := make(chan *interfaces.ErrorMessage, 1)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
-		close(errChan)
-		return nil, nil, errChan
-	}
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
-	// Capture upstream headers from the initial connection synchronously before the goroutine starts.
+	// Capture upstream headers before forwarding the first payload when passthrough is enabled.
 	// Keep a mutable map so bootstrap retries can replace it before first payload is sent.
 	var upstreamHeaders http.Header
 	if passthroughHeadersEnabled {
-		upstreamHeaders = cloneHeader(FilterUpstreamHeaders(streamResult.Headers))
-		if upstreamHeaders == nil {
-			upstreamHeaders = make(http.Header)
-		}
+		upstreamHeaders = make(http.Header)
 	}
-	chunks := streamResult.Chunks
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
 	go func() {
 		defer close(dataChan)
 		defer close(errChan)
+
+		streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+		if err != nil {
+			err = enrichAuthSelectionError(err, providers, normalizedModel)
+			status := http.StatusInternalServerError
+			if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+				if code := se.StatusCode(); code > 0 {
+					status = code
+				}
+			}
+			var addon http.Header
+			if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+				if hdr := he.Headers(); hdr != nil {
+					addon = hdr.Clone()
+				}
+			}
+			_ = sendErrorToChannel(ctx, errChan, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon})
+			return
+		}
+		if passthroughHeadersEnabled {
+			replaceHeader(upstreamHeaders, FilterUpstreamHeaders(streamResult.Headers))
+		}
+
+		chunks := streamResult.Chunks
 		sentPayload := false
 		bootstrapRetries := 0
 		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
@@ -844,6 +844,19 @@ func statusFromError(err error) int {
 		}
 	}
 	return 0
+}
+
+func sendErrorToChannel(ctx context.Context, ch chan<- *interfaces.ErrorMessage, msg *interfaces.ErrorMessage) bool {
+	if ctx == nil {
+		ch <- msg
+		return true
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case ch <- msg:
+		return true
+	}
 }
 
 func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {

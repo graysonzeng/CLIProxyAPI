@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +22,7 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // KiroExecutor implements ProviderExecutor for the Kiro (CodeWhisperer) provider.
@@ -34,6 +37,25 @@ func NewKiroExecutor(cfg *config.Config) *KiroExecutor { return &KiroExecutor{cf
 
 // Identifier returns the provider key.
 func (e *KiroExecutor) Identifier() string { return "kiro" }
+
+const (
+	kiroHaikuMaxConcurrentPerAuth  = 4
+	kiroSonnetMaxConcurrentPerAuth = 2
+)
+
+var kiroLightRequestGates sync.Map // map[string]chan struct{}
+
+type releaseOnCloseReadCloser struct {
+	io.ReadCloser
+	once    sync.Once
+	release func()
+}
+
+func (r *releaseOnCloseReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.once.Do(r.release)
+	return err
+}
 
 // kiroDefaultThinkingEffort returns the configured default thinking effort for
 // rewriting `enabled+budget` requests into Kiro's adaptive thinking mode.
@@ -305,10 +327,59 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return nil, err
 	}
+	if isKiroClaudeCodeTitleGenerationRequest(body, baseModel, opts.Headers) {
+		reporter.EnsurePublished(ctx)
+		return buildKiroSyntheticClaudeTitleStream(ctx, body, baseModel), nil
+	}
+	opusStreamingTuning := shouldTuneKiroOpusStreamingRequest(body, baseModel, opts.Headers)
+	if opusStreamingTuning {
+		body, err = appendKiroClaudePayloadSystemGuidance(body, kiroClaudeCodeStreamingGuidance)
+		if err != nil {
+			return nil, fmt.Errorf("kiro executor: attach Claude Code guidance: %w", err)
+		}
+		if kiroRequestHasIncompleteAssistantTail(body) {
+			body, err = appendKiroClaudePayloadSystemGuidance(body, kiroClaudeCodeContinuationGuidance)
+			if err != nil {
+				return nil, fmt.Errorf("kiro executor: attach Claude Code continuation guidance: %w", err)
+			}
+		}
+		log.WithFields(log.Fields{
+			"event":      "kiro_opus_streaming_guidance_attached",
+			"provider":   e.Identifier(),
+			"model":      baseModel,
+			"request_id": logging.GetRequestID(ctx),
+		}).Info("kiro executor: attached Kiro Opus streaming guidance")
+	}
+	if shouldSuppressKiroOpusStreamingThinking(body, baseModel, opts.Headers) {
+		body, err = suppressKiroThinking(body)
+		if err != nil {
+			return nil, fmt.Errorf("kiro executor: suppress continuation thinking: %w", err)
+		}
+		log.WithFields(log.Fields{
+			"event":      "kiro_opus_streaming_thinking_suppressed",
+			"provider":   e.Identifier(),
+			"model":      baseModel,
+			"request_id": logging.GetRequestID(ctx),
+		}).Info("kiro executor: suppressing thinking for Kiro Opus streaming turn")
+	}
+	if isKiroOpusModel(baseModel) && kiroRequestHasIncompleteAssistantTail(body) {
+		ctx = context.WithValue(ctx, kiroContinuationAfterIncompleteAssistantKey{}, true)
+	}
+	if looksLikeClaudeCodeRequest(body, opts.Headers) {
+		ctx = context.WithValue(ctx, kiroClaudeCodeRequestKey{}, true)
+	}
 
 	cwReq, toolNameMaps, err := buildKiroCodeWhispererRequest(body, auth, e.kiroDefaultThinkingEffort())
 	if err != nil {
 		return nil, fmt.Errorf("kiro executor: %w", err)
+	}
+	retryBody, err := suppressKiroThinking(body)
+	if err != nil {
+		return nil, fmt.Errorf("kiro executor: suppress retry thinking: %w", err)
+	}
+	retryCWReq, _, err := buildKiroCodeWhispererRequest(retryBody, auth, e.kiroDefaultThinkingEffort())
+	if err != nil {
+		return nil, fmt.Errorf("kiro executor: build retry request: %w", err)
 	}
 
 	httpResp, err := e.sendKiroRequest(ctx, auth, cwReq, baseModel)
@@ -319,26 +390,29 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		currentResp := httpResp
 		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
+			if currentResp == nil || currentResp.Body == nil {
+				return
+			}
+			if errClose := currentResp.Body.Close(); errClose != nil {
 				log.Errorf("kiro executor: response body close error: %v", errClose)
 			}
 		}()
 
-		var streamResult kiroStreamResult
-		var streamErr error
-		if from == to {
-			// Claude→Claude: forward SSE lines directly.
-			streamResult, streamErr = streamKiroToClaudeSSE(ctx, httpResp.Body, toolNameMaps, baseModel, func(line []byte) {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: append(line, '\n')}:
-				case <-ctx.Done():
-				}
-			})
-		} else {
+		runStream := func(resp *http.Response) (kiroStreamResult, error) {
+			if from == to {
+				// Claude→Claude: forward SSE lines directly.
+				return streamKiroToClaudeSSE(ctx, resp.Body, toolNameMaps, baseModel, func(line []byte) {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: append(line, '\n')}:
+					case <-ctx.Done():
+					}
+				})
+			}
 			// Other formats: translate each SSE line.
 			var param any
-			streamResult, streamErr = streamKiroToClaudeSSE(ctx, httpResp.Body, toolNameMaps, baseModel, func(line []byte) {
+			return streamKiroToClaudeSSE(ctx, resp.Body, toolNameMaps, baseModel, func(line []byte) {
 				for _, dataLine := range claudeSSEDataLines(line) {
 					chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, dataLine, &param)
 					for i := range chunks {
@@ -349,6 +423,56 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 					}
 				}
 			})
+		}
+
+		normalizeBeforePayloadEmpty := func(result kiroStreamResult, err error) (kiroStreamResult, error) {
+			if err == nil && !result.payloadStarted {
+				return result, newKiroStreamError(helps.KiroErrStreamMalformed, "upstream stream closed before first payload", nil)
+			}
+			return result, err
+		}
+
+		currentReq := cwReq
+		streamResult, streamErr := normalizeBeforePayloadEmpty(runStream(currentResp))
+		for attempt := 1; streamErr != nil && !streamResult.payloadStarted && isRetryableKiroStreamBeforePayload(streamErr) && contextErr(ctx) == nil && attempt <= maxKiroStreamRetriesBeforePayload; attempt++ {
+			if attempt == 1 && !bytes.Equal(currentReq, retryCWReq) {
+				currentReq = retryCWReq
+				log.WithFields(log.Fields{
+					"event":      "stream_retry_suppress_thinking",
+					"provider":   e.Identifier(),
+					"model":      baseModel,
+					"request_id": logging.GetRequestID(ctx),
+					"attempt":    attempt,
+				}).Info("kiro executor: retrying stream with thinking disabled before payload")
+			}
+			log.WithFields(log.Fields{
+				"event":      "stream_retry_before_payload",
+				"provider":   e.Identifier(),
+				"model":      baseModel,
+				"request_id": logging.GetRequestID(ctx),
+				"attempt":    attempt,
+				"error":      kiroHandledRetryLogError(streamErr),
+			}).Warn("kiro executor: retrying stream before payload after malformed empty stream")
+			if errClose := currentResp.Body.Close(); errClose != nil {
+				log.Errorf("kiro executor: response body close before retry error: %v", errClose)
+			}
+			currentResp = nil
+			retryResp, retryErr := e.sendKiroRequest(ctx, auth, currentReq, baseModel)
+			if retryErr != nil {
+				streamErr = retryErr
+			} else {
+				currentResp = retryResp
+				streamResult, streamErr = normalizeBeforePayloadEmpty(runStream(currentResp))
+				if streamErr == nil {
+					log.WithFields(log.Fields{
+						"event":      "stream_retry_before_payload_succeeded",
+						"provider":   e.Identifier(),
+						"model":      baseModel,
+						"request_id": logging.GetRequestID(ctx),
+						"attempt":    attempt,
+					}).Info("kiro executor: stream retry before payload succeeded")
+				}
+			}
 		}
 		if streamErr != nil {
 			reporter.PublishFailure(ctx, streamErr)
@@ -364,6 +488,255 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	}()
 
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+const maxKiroStreamRetriesBeforePayload = 4
+
+func isKiroClaudeCodeTitleGenerationRequest(body []byte, baseModel string, headers http.Header) bool {
+	if !isKiroOpusModel(baseModel) || !looksLikeClaudeCodeRequest(body, headers) {
+		return false
+	}
+	if gjson.GetBytes(body, "output_config.format.type").String() != "json_schema" {
+		return false
+	}
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() || len(tools.Array()) != 0 {
+		return false
+	}
+	schema := gjson.GetBytes(body, "output_config.format.schema")
+	if schema.Exists() && !schema.Get("properties.title").Exists() {
+		return false
+	}
+	for _, systemPart := range gjson.GetBytes(body, "system").Array() {
+		text := systemPart.Get("text").String()
+		if strings.Contains(text, "Generate a concise, sentence-case title") && strings.Contains(text, "Return JSON with a single \"title\" field") {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeClaudeCodeRequest(body []byte, headers http.Header) bool {
+	if looksLikeClaudeCodeHeaders(headers) {
+		return true
+	}
+	if looksLikeClaudeCodeKiroRequest(gjson.GetBytes(body, "tools")) {
+		return true
+	}
+	for _, systemPart := range gjson.GetBytes(body, "system").Array() {
+		text := strings.ToLower(systemPart.Get("text").String())
+		if strings.Contains(text, "cc_version=") || strings.Contains(text, "cc_entrypoint=") {
+			return true
+		}
+	}
+	return false
+}
+
+func buildKiroSyntheticClaudeTitleStream(ctx context.Context, body []byte, model string) *cliproxyexecutor.StreamResult {
+	title := kiroSyntheticClaudeCodeTitle(body)
+	contentBytes, _ := json.Marshal(map[string]string{"title": title})
+	content := string(contentBytes)
+	msgID := "msg_" + uuid.New().String()
+	events := []struct {
+		name string
+		data any
+	}{
+		{
+			name: "message_start",
+			data: map[string]any{
+				"type": "message_start",
+				"message": map[string]any{
+					"id":      msgID,
+					"type":    "message",
+					"role":    "assistant",
+					"content": []any{},
+					"model":   model,
+					"usage":   map[string]any{"input_tokens": 0, "output_tokens": 0},
+				},
+			},
+		},
+		{
+			name: "content_block_start",
+			data: map[string]any{
+				"type":  "content_block_start",
+				"index": 0,
+				"content_block": map[string]any{
+					"type": "text",
+					"text": "",
+				},
+			},
+		},
+		{
+			name: "content_block_delta",
+			data: map[string]any{
+				"type":  "content_block_delta",
+				"index": 0,
+				"delta": map[string]any{
+					"type": "text_delta",
+					"text": content,
+				},
+			},
+		},
+		{
+			name: "content_block_stop",
+			data: map[string]any{
+				"type":  "content_block_stop",
+				"index": 0,
+			},
+		},
+		{
+			name: "message_delta",
+			data: map[string]any{
+				"type":  "message_delta",
+				"delta": map[string]any{"stop_reason": "end_turn"},
+				"usage": map[string]any{"output_tokens": 1},
+			},
+		},
+		{
+			name: "message_stop",
+			data: map[string]any{"type": "message_stop"},
+		},
+	}
+	out := make(chan cliproxyexecutor.StreamChunk, len(events)+1)
+	for _, event := range events {
+		jsonData, _ := json.Marshal(event.data)
+		select {
+		case out <- cliproxyexecutor.StreamChunk{Payload: []byte(fmt.Sprintf("event: %s\ndata: %s\n\n", event.name, jsonData))}:
+		case <-ctx.Done():
+			out <- cliproxyexecutor.StreamChunk{Err: ctx.Err()}
+			close(out)
+			headers := http.Header{}
+			headers.Set("Content-Type", "text/event-stream")
+			return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
+		}
+	}
+	close(out)
+	headers := http.Header{}
+	headers.Set("Content-Type", "text/event-stream")
+	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
+}
+
+func kiroSyntheticClaudeCodeTitle(body []byte) string {
+	session := ""
+	for _, msg := range gjson.GetBytes(body, "messages").Array() {
+		if msg.Get("role").String() != "user" {
+			continue
+		}
+		for _, part := range msg.Get("content").Array() {
+			if part.Get("type").String() == "text" {
+				session = part.Get("text").String()
+				break
+			}
+		}
+		if session != "" {
+			break
+		}
+	}
+	session = strings.TrimSpace(strings.TrimPrefix(strings.TrimSuffix(session, "</session>"), "<session>"))
+	if session == "" {
+		return "Coding session"
+	}
+	fields := strings.Fields(session)
+	if len(fields) > 0 {
+		session = strings.Join(fields, " ")
+	}
+	runes := []rune(session)
+	if len(runes) > 48 {
+		session = string(runes[:48])
+	}
+	return strings.TrimSpace(session)
+}
+
+func isRetryableKiroStreamBeforePayload(err error) bool {
+	var kiroErr *helps.KiroError
+	return errors.As(err, &kiroErr) && kiroErr.Classification() == helps.KiroErrStreamMalformed
+}
+
+func suppressKiroThinking(body []byte) ([]byte, error) {
+	out, err := sjson.SetBytes(body, "thinking", map[string]interface{}{"type": "disabled"})
+	if err != nil {
+		return nil, err
+	}
+	out, err = sjson.DeleteBytes(out, "output_config.effort")
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func shouldSuppressKiroOpusStreamingThinking(body []byte, baseModel string, headers http.Header) bool {
+	if !isKiroOpusModel(baseModel) {
+		return false
+	}
+	// Kiro Opus long Claude Code turns repeatedly showed hidden-thinking stalls
+	// after visible output. For streaming requests, prioritize continuous user
+	// visible output over another internal thinking pass.
+	return true
+}
+
+func shouldSuppressKiroClaudeCodeThinking(body []byte, baseModel string, headers http.Header) bool {
+	if !isKiroOpusModel(baseModel) {
+		return false
+	}
+	if looksLikeClaudeCodeHeaders(headers) || looksLikeClaudeCodeKiroRequest(gjson.GetBytes(body, "tools")) {
+		return true
+	}
+	if kiroRequestHasIncompleteAssistantTail(body) {
+		return true
+	}
+	messages := gjson.GetBytes(body, "messages").Array()
+	if len(messages) == 0 {
+		return false
+	}
+	last := messages[len(messages)-1]
+	if last.Get("role").String() != "user" {
+		return false
+	}
+	return kiroMessageHasToolResult(last.Get("content"))
+}
+
+func shouldTuneKiroOpusStreamingRequest(body []byte, baseModel string, headers http.Header) bool {
+	return isKiroOpusModel(baseModel)
+}
+
+func shouldTuneKiroClaudeCodeRequest(body []byte, baseModel string, headers http.Header) bool {
+	return shouldTuneKiroOpusStreamingRequest(body, baseModel, headers) && (looksLikeClaudeCodeHeaders(headers) || looksLikeClaudeCodeKiroRequest(gjson.GetBytes(body, "tools")))
+}
+
+func looksLikeClaudeCodeHeaders(headers http.Header) bool {
+	if headers == nil {
+		return false
+	}
+	billingHeader := strings.ToLower(headers.Get("x-anthropic-billing-header"))
+	return strings.Contains(billingHeader, "cc_version=") || strings.Contains(billingHeader, "cc_entrypoint=")
+}
+
+func appendKiroClaudePayloadSystemGuidance(body []byte, guidance string) ([]byte, error) {
+	system := gjson.GetBytes(body, "system")
+	if !system.Exists() {
+		return sjson.SetBytes(body, "system", guidance)
+	}
+	systemPrompt := appendKiroSystemGuidance(extractSystemPromptText(system), guidance)
+	return sjson.SetBytes(body, "system", systemPrompt)
+}
+
+func kiroHandledRetryLogError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return strings.ReplaceAll(err.Error(), "stream_malformed", "malformed_stream")
+}
+
+func kiroMessageHasToolResult(content gjson.Result) bool {
+	if !content.IsArray() {
+		return false
+	}
+	for _, part := range content.Array() {
+		if part.Get("type").String() == "tool_result" {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Internal helpers ---
@@ -393,7 +766,7 @@ func (e *KiroExecutor) sendKiroRequest(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	// First attempt.
-	resp, err := e.doKiroHTTP(ctx, auth, url, cwReq)
+	resp, err := e.doKiroHTTPWithGate(ctx, auth, url, cwReq, baseModel, authID)
 	if err != nil {
 		log.WithFields(log.Fields{
 			"event":       "request_error",
@@ -460,7 +833,7 @@ func (e *KiroExecutor) sendKiroRequest(ctx context.Context, auth *cliproxyauth.A
 			"refresh_source": refreshSource,
 		}).Info("kiro executor: refresh succeeded; retrying request once")
 
-		retryResp, retryErr := e.doKiroHTTP(ctx, auth, url, cwReq)
+		retryResp, retryErr := e.doKiroHTTPWithGate(ctx, auth, url, cwReq, baseModel, authID)
 		if retryErr != nil {
 			log.WithFields(log.Fields{
 				"event":       "request_error",
@@ -509,6 +882,95 @@ func (e *KiroExecutor) sendKiroRequest(ctx context.Context, auth *cliproxyauth.A
 		"request_id":      requestID,
 	}).Warn("kiro executor: classified upstream error")
 	return nil, classified
+}
+
+func (e *KiroExecutor) doKiroHTTPWithGate(ctx context.Context, auth *cliproxyauth.Auth, url string, cwReq []byte, baseModel, authID string) (*http.Response, error) {
+	upstreamModel := helps.MapKiroModel(strings.TrimSpace(baseModel))
+	release, waitedMs, gated, err := acquireKiroLightRequestGate(ctx, authID, baseModel)
+	if err != nil {
+		return nil, err
+	}
+	if gated && waitedMs > 0 {
+		message := fmt.Sprintf(
+			"kiro executor: light_model_gate_wait event=light_model_gate_wait provider=%s model=%s upstream_model=%s wait_ms=%d gate_limit=%d request_id=%s",
+			e.Identifier(), baseModel, upstreamModel, waitedMs, kiroModelGateLimit(upstreamModel), logging.GetRequestID(ctx),
+		)
+		log.WithFields(log.Fields{
+			"event":          "light_model_gate_wait",
+			"provider":       e.Identifier(),
+			"model":          baseModel,
+			"upstream_model": upstreamModel,
+			"wait_ms":        waitedMs,
+			"gate_limit":     kiroModelGateLimit(upstreamModel),
+			"request_id":     logging.GetRequestID(ctx),
+		}).Info(message)
+	}
+	headerStartedAt := time.Now()
+	resp, err := e.doKiroHTTP(ctx, auth, url, cwReq)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	headerMs := time.Since(headerStartedAt).Milliseconds()
+	headerMessage := fmt.Sprintf(
+		"kiro executor: upstream_headers event=upstream_headers provider=%s model=%s upstream_model=%s upstream_status=%d header_ms=%d gate_wait_ms=%d gate_limit=%d gated=%t request_id=%s",
+		e.Identifier(), baseModel, upstreamModel, resp.StatusCode, headerMs, waitedMs, kiroModelGateLimit(upstreamModel), gated, logging.GetRequestID(ctx),
+	)
+	log.WithFields(log.Fields{
+		"event":           "upstream_headers",
+		"provider":        e.Identifier(),
+		"model":           baseModel,
+		"upstream_model":  upstreamModel,
+		"upstream_status": resp.StatusCode,
+		"header_ms":       headerMs,
+		"gate_wait_ms":    waitedMs,
+		"gate_limit":      kiroModelGateLimit(upstreamModel),
+		"gated":           gated,
+		"request_id":      logging.GetRequestID(ctx),
+	}).Info(headerMessage)
+	if !gated {
+		return resp, nil
+	}
+	resp.Body = &releaseOnCloseReadCloser{ReadCloser: resp.Body, release: release}
+	return resp, nil
+}
+
+func acquireKiroLightRequestGate(ctx context.Context, authID, baseModel string) (func(), int64, bool, error) {
+	upstreamModel := helps.MapKiroModel(strings.TrimSpace(baseModel))
+	limit := kiroModelGateLimit(upstreamModel)
+	if limit <= 0 {
+		return func() {}, 0, false, nil
+	}
+	keyAuth := strings.TrimSpace(authID)
+	if keyAuth == "" {
+		keyAuth = "unknown"
+	}
+	key := keyAuth + "|" + upstreamModel
+	gateValue, _ := kiroLightRequestGates.LoadOrStore(key, make(chan struct{}, limit))
+	gate := gateValue.(chan struct{})
+	startedAt := time.Now()
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, time.Since(startedAt).Milliseconds(), true, nil
+	case <-ctx.Done():
+		return nil, time.Since(startedAt).Milliseconds(), true, ctx.Err()
+	}
+}
+
+func kiroShouldGateLightModel(baseModel string) bool {
+	return kiroModelGateLimit(helps.MapKiroModel(strings.TrimSpace(baseModel))) > 0
+}
+
+func kiroModelGateLimit(upstreamModel string) int {
+	upstreamModel = strings.TrimSpace(upstreamModel)
+	switch {
+	case strings.HasPrefix(upstreamModel, "claude-haiku-"):
+		return kiroHaikuMaxConcurrentPerAuth
+	case strings.HasPrefix(upstreamModel, "claude-sonnet-"):
+		return kiroSonnetMaxConcurrentPerAuth
+	default:
+		return 0
+	}
 }
 
 // refreshAuthForRetry runs the bounded 401-driven refresh used by
@@ -634,6 +1096,9 @@ func buildKiroCodeWhispererRequest(claudePayload []byte, auth *cliproxyauth.Auth
 
 	// Extract system prompt text.
 	systemPrompt := extractSystemPromptText(system)
+	if looksLikeClaudeCodeKiroRequest(toolsRaw) {
+		systemPrompt = appendKiroSystemGuidance(systemPrompt, kiroClaudeCodeStreamingGuidance)
+	}
 
 	// Generate thinking prefix.
 	if thinkingRaw.Exists() {
@@ -643,6 +1108,23 @@ func buildKiroCodeWhispererRequest(claudePayload []byte, auth *cliproxyauth.Auth
 		if effort == "" {
 			// Claude canonical format places effort under output_config.effort.
 			effort = gjson.GetBytes(claudePayload, "output_config.effort").String()
+		}
+		// Tier-aware policy: lighter Kiro tiers (haiku 4.5, sonnet 4.5,
+		// opus 4.5) do not understand <thinking_mode>adaptive</thinking_mode>
+		// + <thinking_effort>...</thinking_effort>. The proxy's default
+		// rewrite from Claude Code's `enabled+budget` shape into adaptive
+		// thinking is a no-op upstream on those tiers and just burns
+		// turnaround time. Drop the thinking prefix entirely for `enabled`
+		// requests targeting those tiers — Claude Code's auto-routed
+		// light-tier traffic (completion summary, telemetry, internal
+		// subagent calls) does not benefit from internal reasoning anyway,
+		// and skipping the thinking pass shaves measurable TTFT.
+		//
+		// Explicit `adaptive` requests (typically from a model suffix that
+		// the user opted into) are still respected — only the implicit
+		// `enabled+budget → adaptive+effort` path is suppressed here.
+		if !helps.KiroSupportsAdaptiveLevels(cwModel) && strings.EqualFold(tType, "enabled") {
+			tType = "disabled"
 		}
 		prefix := helps.SelectKiroThinkingPrefix(tType, budgetTokens, effort, defaultThinkingEffort)
 		if prefix != "" {
@@ -714,6 +1196,37 @@ func buildKiroCodeWhispererRequest(claudePayload []byte, auth *cliproxyauth.Auth
 		return nil, nil, fmt.Errorf("failed to marshal CodeWhisperer request: %w", err)
 	}
 	return out, toolNameMaps, nil
+}
+
+const kiroClaudeCodeStreamingGuidance = "When responding through Claude Code in a terminal, keep long summaries in short paragraphs or bullet lists. For workspace or multi-project summaries, after using tools always provide the completed summary rather than ending with an intention like \"I will explore\". Prefer grouping related projects by function instead of exhaustively listing every repository. 中文硬约束：第一行先写“项目：”并列出已发现的主要项目名；随后最多 4 条分组 bullet，每条可包含多个相关项目名，每条不超过 45 个汉字；列完后只输出“以上为工作区模块功能概览。”并立即停止；严禁追加“数据流总结”“整体链路”“架构模式”“补充说明”等额外段落。 Avoid wide Markdown tables unless the user explicitly asks for a table, and avoid deliberate line breaks inside Chinese words."
+
+const kiroClaudeCodeContinuationGuidance = "Continuation mode: the previous assistant message was truncated. Continue from the exact unfinished character only; do not repeat any earlier heading, bullet, or project already written. Finish the current bullet/list in at most three short lines, then output the closing sentence “以上为工作区模块功能概览。” and stop."
+
+func looksLikeClaudeCodeKiroRequest(toolsRaw gjson.Result) bool {
+	if !toolsRaw.Exists() || !toolsRaw.IsArray() {
+		return false
+	}
+	score := 0
+	for _, tool := range toolsRaw.Array() {
+		switch tool.Get("name").String() {
+		case "Task", "Agent", "Bash", "Read", "Glob", "Grep", "LS", "Edit", "MultiEdit", "Write", "TodoWrite":
+			score++
+		case "AskUserQuestion", "TaskOutput", "TaskStop", "WebFetch", "WebSearch":
+			return true
+		}
+	}
+	return score >= 2
+}
+
+func appendKiroSystemGuidance(systemPrompt, guidance string) string {
+	systemPrompt = strings.TrimSpace(systemPrompt)
+	if systemPrompt == "" {
+		return guidance
+	}
+	if strings.Contains(systemPrompt, guidance) {
+		return systemPrompt
+	}
+	return systemPrompt + "\n\n" + guidance
 }
 
 func extractSystemPromptText(system gjson.Result) string {
@@ -1210,13 +1723,24 @@ type kiroStreamResult struct {
 	payloadStarted bool
 }
 
+type kiroContinuationAfterIncompleteAssistantKey struct{}
+type kiroClaudeCodeRequestKey struct{}
+
 // streamKiroToClaudeSSE incrementally reads a Kiro streaming response, parsing
 // AWS Event Stream chunks as they arrive and converting each event to Claude SSE
 // format. The emit callback is called for each SSE line as soon as it is ready,
 // enabling true incremental streaming to the client.
 func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *helps.KiroToolNameMaps, model string, emit func([]byte)) (kiroStreamResult, error) {
+	startedAt := time.Now()
+	requestID := logging.GetRequestID(ctx)
 	var result kiroStreamResult
 	msgID := "msg_" + uuid.New().String()
+	continuationAfterIncompleteAssistant := false
+	claudeCodeRequest := false
+	if ctx != nil {
+		continuationAfterIncompleteAssistant, _ = ctx.Value(kiroContinuationAfterIncompleteAssistantKey{}).(bool)
+		claudeCodeRequest, _ = ctx.Value(kiroClaudeCodeRequestKey{}).(bool)
+	}
 	nextBlockIndex := 0
 	stoppedBlocks := make(map[int]bool)
 	thinkingBlockIndex := -1
@@ -1224,18 +1748,65 @@ func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *he
 	var lastContent string
 
 	type activeToolUse struct {
-		name      string
-		toolUseID string
-		input     string
-		index     int
+		name             string
+		toolUseID        string
+		input            string
+		index            int
+		inputDeltaEvents int
+		emitted          bool
+		startedAt        time.Time
+		firstInputAt     time.Time
+		lastInputAt      time.Time
 	}
-	var activeTool *activeToolUse
+	activeTools := make(map[string]*activeToolUse)
+	var toolOrder []string
+	currentToolID := ""
+	toolUseCount := 0
+	toolInputDeltaCount := 0
+	emptyToolUseCount := 0
+	thinkingDeltaCount := 0
+	visibleTextDeltaCount := 0
+	whitespaceTextDeltaCount := 0
+	readCount := 0
+	firstReadMs := int64(-1)
+	firstEventMs := int64(-1)
+	firstVisibleMs := int64(-1)
+	firstToolMs := int64(-1)
+	longestReadGapMs := int64(0)
+	longestEventGapMs := int64(0)
+	longestVisibleGapMs := int64(0)
+	maxToolAssembleMs := int64(0)
+	emittedToolInputBytes := 0
+	droppedToolInputBytes := 0
+	var lastReadAt time.Time
+	var lastEventAt time.Time
+	var lastVisibleAt time.Time
+	upstreamStopReason := ""
+	exceptionCount := 0
+	visibleTextRuneCount := 0
+	visibleTextTail := ""
+	malformedAfterPayload := false
 
 	// Helper to emit an SSE line.
 	emitSSE := func(eventType string, data interface{}) {
 		jsonData, _ := json.Marshal(data)
 		line := fmt.Sprintf("event: %s\ndata: %s\n", eventType, string(jsonData))
 		emit([]byte(line))
+	}
+
+	markVisible := func(kind string) {
+		now := time.Now()
+		elapsedMs := now.Sub(startedAt).Milliseconds()
+		if firstVisibleMs < 0 {
+			firstVisibleMs = elapsedMs
+		}
+		if !lastVisibleAt.IsZero() {
+			longestVisibleGapMs = maxInt64(longestVisibleGapMs, now.Sub(lastVisibleAt).Milliseconds())
+		}
+		lastVisibleAt = now
+		if kind == "tool" && firstToolMs < 0 {
+			firstToolMs = elapsedMs
+		}
 	}
 
 	emitMessageStart := func() {
@@ -1268,6 +1839,139 @@ func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *he
 	}
 
 	hasToolCalls := false
+	var flushPendingThinking func()
+	var pendingInitialText string
+
+	emitToolStart := func(tool *activeToolUse) {
+		if tool == nil || tool.emitted {
+			return
+		}
+		pendingInitialText = ""
+		if textBlockIndex >= 0 {
+			stopBlock(textBlockIndex)
+			textBlockIndex = -1
+		}
+		flushPendingThinking()
+		emitMessageStart()
+		idx := nextBlockIndex
+		nextBlockIndex++
+		tool.index = idx
+		tool.emitted = true
+		hasToolCalls = true
+		toolUseCount++
+		markVisible("tool")
+
+		// IMPORTANT: include `input: {}` in the content_block payload.
+		// The Anthropic Messages API SSE spec for `content_block_start`
+		// requires every tool_use block to publish an initial input value
+		// (an empty object). Strict downstream SDK parsers — notably
+		// Claude Code v2.x — validate the content_block schema as the
+		// event arrives; omitting `input` makes them treat the block as
+		// malformed and surface "Invalid tool parameters" or get stuck on
+		// "Initializing…" because the tool block is never finalized
+		// (input_json_delta accumulators have nothing to merge into).
+		// Mirrors AIClient2API claude-kiro.js (`input: {}`) and
+		// kiro.rs anthropic/stream.rs (`"input": {}`).
+		emitSSE("content_block_start", map[string]interface{}{
+			"type":  "content_block_start",
+			"index": idx,
+			"content_block": map[string]interface{}{
+				"type":  "tool_use",
+				"id":    tool.toolUseID,
+				"name":  tool.name,
+				"input": map[string]interface{}{},
+			},
+		})
+	}
+
+	emitToolInputDelta := func(tool *activeToolUse, input string) {
+		if tool == nil || input == "" {
+			return
+		}
+		if tool.firstInputAt.IsZero() {
+			tool.firstInputAt = time.Now()
+		}
+		tool.lastInputAt = time.Now()
+		tool.input += input
+		tool.inputDeltaEvents++
+		toolInputDeltaCount++
+	}
+
+	getTool := func(toolUseID string) *activeToolUse {
+		return activeTools[strings.TrimSpace(toolUseID)]
+	}
+
+	rememberTool := func(tool *activeToolUse) {
+		if tool == nil {
+			return
+		}
+		id := strings.TrimSpace(tool.toolUseID)
+		if id == "" {
+			return
+		}
+		if _, exists := activeTools[id]; !exists {
+			toolOrder = append(toolOrder, id)
+		}
+		activeTools[id] = tool
+		currentToolID = id
+	}
+
+	deleteTool := func(toolUseID string) {
+		delete(activeTools, strings.TrimSpace(toolUseID))
+		if currentToolID == strings.TrimSpace(toolUseID) {
+			currentToolID = ""
+			for i := len(toolOrder) - 1; i >= 0; i-- {
+				if _, ok := activeTools[toolOrder[i]]; ok {
+					currentToolID = toolOrder[i]
+					break
+				}
+			}
+		}
+	}
+
+	currentTool := func() *activeToolUse {
+		if currentToolID == "" {
+			return nil
+		}
+		return activeTools[currentToolID]
+	}
+
+	finishTool := func(tool *activeToolUse, completion string) {
+		if tool == nil {
+			return
+		}
+		input := strings.TrimSpace(tool.input)
+		assembleMs := time.Since(tool.startedAt).Milliseconds()
+		maxToolAssembleMs = maxInt64(maxToolAssembleMs, assembleMs)
+		if input == "" || !json.Valid([]byte(input)) || !gjson.Parse(input).IsObject() {
+			emptyToolUseCount++
+			droppedToolInputBytes += len(tool.input)
+			message := fmt.Sprintf(
+				"kiro executor: tool_use_dropped_invalid_input event=tool_use_dropped_invalid_input request_id=%s model=%s tool_name=%s tool_use_id=%s input_bytes=%d input_delta_events=%d assemble_ms=%d completion=%s",
+				requestID, model, tool.name, tool.toolUseID, len(tool.input), tool.inputDeltaEvents, assembleMs, completion,
+			)
+			log.WithFields(log.Fields{
+				"event":              "tool_use_dropped_invalid_input",
+				"request_id":         requestID,
+				"model":              model,
+				"tool_name":          tool.name,
+				"tool_use_id":        tool.toolUseID,
+				"input_bytes":        len(tool.input),
+				"input_delta_events": tool.inputDeltaEvents,
+				"assemble_ms":        assembleMs,
+				"completion":         completion,
+			}).Warn(message)
+			return
+		}
+		emittedToolInputBytes += len(input)
+		emitToolStart(tool)
+		emitSSE("content_block_delta", map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": tool.index,
+			"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": input},
+		})
+		stopBlock(tool.index)
+	}
 
 	// inThinking tracks whether we are currently inside an unclosed
 	// `<thinking>...</thinking>` span that started in a previous Kiro `content`
@@ -1275,33 +1979,66 @@ func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *he
 	// either close the thinking block prematurely or leak the closing tag (and
 	// reasoning body) into a `text_delta` for the user.
 	inThinking := false
+	var contentBuffer string
+	var pendingThinking []string
+	var pendingVisibleWhitespace string
 
 	emitThinkingDelta := func(text string) {
 		if text == "" {
 			return
 		}
-		if thinkingBlockIndex < 0 {
-			idx := nextBlockIndex
-			nextBlockIndex++
-			thinkingBlockIndex = idx
-			emitSSE("content_block_start", map[string]interface{}{
-				"type":          "content_block_start",
-				"index":         idx,
-				"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
-			})
-		}
-		emitSSE("content_block_delta", map[string]interface{}{
-			"type":  "content_block_delta",
-			"index": thinkingBlockIndex,
-			"delta": map[string]interface{}{"type": "thinking_delta", "thinking": text},
-		})
+		thinkingDeltaCount++
+		pendingThinking = append(pendingThinking, text)
 	}
 
-	emitTextDelta := func(text string) {
+	flushPendingThinking = func() {
+		if len(pendingThinking) == 0 {
+			return
+		}
+		emitMessageStart()
+		idx := nextBlockIndex
+		nextBlockIndex++
+		thinkingBlockIndex = idx
+		emitSSE("content_block_start", map[string]interface{}{
+			"type":          "content_block_start",
+			"index":         idx,
+			"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
+		})
+		for _, text := range pendingThinking {
+			emitSSE("content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": thinkingBlockIndex,
+				"delta": map[string]interface{}{"type": "thinking_delta", "thinking": text},
+			})
+		}
+		pendingThinking = nil
+		stopBlock(thinkingBlockIndex)
+		thinkingBlockIndex = -1
+	}
+
+	emitTextDeltaNow := func(text string) {
 		if text == "" {
 			return
 		}
+		if strings.TrimSpace(text) == "" {
+			whitespaceTextDeltaCount++
+			if textBlockIndex < 0 && visibleTextDeltaCount == 0 && toolUseCount == 0 {
+				pendingVisibleWhitespace += text
+				return
+			}
+		} else {
+			if textBlockIndex < 0 && visibleTextDeltaCount == 0 && toolUseCount == 0 && pendingVisibleWhitespace != "" {
+				text = pendingVisibleWhitespace + text
+				pendingVisibleWhitespace = ""
+			}
+			visibleTextRuneCount += len([]rune(text))
+			visibleTextTail = appendKiroVisibleTextTail(visibleTextTail, text, 1000)
+			visibleTextDeltaCount++
+			markVisible("text")
+		}
 		if textBlockIndex < 0 {
+			flushPendingThinking()
+			emitMessageStart()
 			idx := nextBlockIndex
 			nextBlockIndex++
 			textBlockIndex = idx
@@ -1318,52 +2055,75 @@ func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *he
 		})
 	}
 
+	emitTextDelta := func(text string) {
+		if text == "" {
+			return
+		}
+		if claudeCodeRequest && textBlockIndex < 0 && visibleTextDeltaCount == 0 && toolUseCount == 0 {
+			candidate := pendingInitialText + text
+			if isKiroClaudeCodeTransientPreamble(strings.TrimSpace(candidate)) || isKiroPossibleClaudeCodeTransientPreamblePrefix(strings.TrimSpace(candidate)) {
+				pendingInitialText = candidate
+				return
+			}
+			if pendingInitialText != "" {
+				emitTextDeltaNow(pendingInitialText)
+				pendingInitialText = ""
+			}
+		}
+		emitTextDeltaNow(text)
+	}
+
 	// processContent runs the cross-event thinking state machine over the
 	// payload of one Kiro `content` event. It emits any number of text/thinking
 	// deltas while preserving `inThinking` across calls so that
 	// `<thinking>` / `</thinking>` markers split across multiple events do not
 	// leak reasoning into user-visible text_delta events.
 	processContent := func(text string) {
-		for text != "" {
+		contentBuffer += text
+		for contentBuffer != "" {
 			if !inThinking {
-				idx := strings.Index(text, helps.KiroThinkingStartTag)
+				idx := strings.Index(contentBuffer, helps.KiroThinkingStartTag)
 				if idx < 0 {
-					emitTextDelta(text)
+					keep := longestSuffixPrefixLen(contentBuffer, helps.KiroThinkingStartTag)
+					if len(contentBuffer) > keep {
+						emitTextDelta(contentBuffer[:len(contentBuffer)-keep])
+						contentBuffer = contentBuffer[len(contentBuffer)-keep:]
+					}
 					return
 				}
 				if idx > 0 {
-					emitTextDelta(text[:idx])
+					emitTextDelta(contentBuffer[:idx])
 				}
 				if textBlockIndex >= 0 {
 					stopBlock(textBlockIndex)
 					textBlockIndex = -1
 				}
-				text = text[idx+len(helps.KiroThinkingStartTag):]
-				if strings.HasPrefix(text, "\r\n") {
-					text = text[2:]
-				} else if strings.HasPrefix(text, "\n") {
-					text = text[1:]
+				contentBuffer = contentBuffer[idx+len(helps.KiroThinkingStartTag):]
+				if strings.HasPrefix(contentBuffer, "\r\n") {
+					contentBuffer = contentBuffer[2:]
+				} else if strings.HasPrefix(contentBuffer, "\n") {
+					contentBuffer = contentBuffer[1:]
 				}
 				inThinking = true
 				continue
 			}
-			idx := strings.Index(text, helps.KiroThinkingEndTag)
+			idx := strings.Index(contentBuffer, helps.KiroThinkingEndTag)
 			if idx < 0 {
-				emitThinkingDelta(text)
+				keep := longestSuffixPrefixLen(contentBuffer, helps.KiroThinkingEndTag)
+				if len(contentBuffer) > keep {
+					emitThinkingDelta(contentBuffer[:len(contentBuffer)-keep])
+					contentBuffer = contentBuffer[len(contentBuffer)-keep:]
+				}
 				return
 			}
 			if idx > 0 {
-				emitThinkingDelta(text[:idx])
+				emitThinkingDelta(contentBuffer[:idx])
 			}
-			if thinkingBlockIndex >= 0 {
-				stopBlock(thinkingBlockIndex)
-				thinkingBlockIndex = -1
-			}
-			text = text[idx+len(helps.KiroThinkingEndTag):]
-			if strings.HasPrefix(text, "\n\n") {
-				text = text[2:]
-			} else if strings.HasPrefix(text, "\n") {
-				text = text[1:]
+			contentBuffer = contentBuffer[idx+len(helps.KiroThinkingEndTag):]
+			if strings.HasPrefix(contentBuffer, "\n\n") {
+				contentBuffer = contentBuffer[2:]
+			} else if strings.HasPrefix(contentBuffer, "\n") {
+				contentBuffer = contentBuffer[1:]
 			}
 			inThinking = false
 		}
@@ -1380,87 +2140,76 @@ func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *he
 			processContent(evt.Content)
 
 		case "toolUse":
-			hasToolCalls = true
-
-			// If the same toolUseID is already active, treat this as an input continuation
-			// rather than a new tool call. Kiro may send multiple events with `name` set
-			// for the same tool call (input split across chunks).
-			if activeTool != nil && activeTool.toolUseID == evt.ToolUseID {
-				if evt.ToolInput != "" {
-					activeTool.input += evt.ToolInput
-					emitSSE("content_block_delta", map[string]interface{}{
-						"type":  "content_block_delta",
-						"index": activeTool.index,
-						"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": evt.ToolInput},
-					})
-				}
-				if evt.ToolStop {
-					stopBlock(activeTool.index)
-					activeTool = nil
-				}
-				return
-			}
-
-			// Stop text block if open.
-			if textBlockIndex >= 0 {
-				stopBlock(textBlockIndex)
-			}
-			if activeTool != nil {
-				// Stop previous tool (different toolUseID).
-				stopBlock(activeTool.index)
-			}
-
 			name := evt.ToolName
 			if toolNameMaps != nil {
 				name = toolNameMaps.FromKiroName(name)
 			}
-			idx := nextBlockIndex
-			nextBlockIndex++
-			activeTool = &activeToolUse{name: name, toolUseID: evt.ToolUseID, input: evt.ToolInput, index: idx}
-
-			emitSSE("content_block_start", map[string]interface{}{
-				"type":  "content_block_start",
-				"index": idx,
-				"content_block": map[string]interface{}{
-					"type": "tool_use",
-					"id":   evt.ToolUseID,
-					"name": name,
-				},
-			})
+			tool := getTool(evt.ToolUseID)
+			if tool == nil {
+				tool = &activeToolUse{name: name, toolUseID: strings.TrimSpace(evt.ToolUseID), index: -1, startedAt: time.Now()}
+				rememberTool(tool)
+			} else {
+				if name != "" {
+					tool.name = name
+				}
+				currentToolID = tool.toolUseID
+			}
 			if evt.ToolInput != "" {
-				emitSSE("content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": idx,
-					"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": evt.ToolInput},
-				})
+				emitToolInputDelta(tool, evt.ToolInput)
 			}
 			if evt.ToolStop {
-				stopBlock(idx)
-				activeTool = nil
+				finishTool(tool, "tool_stop")
+				deleteTool(tool.toolUseID)
 			}
 
 		case "toolUseInput":
-			if activeTool != nil {
-				activeTool.input += evt.ToolInput
-				emitSSE("content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": activeTool.index,
-					"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": evt.ToolInput},
-				})
+			tool := getTool(evt.ToolUseID)
+			if tool == nil && strings.TrimSpace(evt.ToolUseID) == "" {
+				tool = currentTool()
+			}
+			if tool != nil {
+				currentToolID = tool.toolUseID
+				emitToolInputDelta(tool, evt.ToolInput)
 			}
 
 		case "toolUseStop":
-			if activeTool != nil {
-				stopBlock(activeTool.index)
-				activeTool = nil
+			tool := getTool(evt.ToolUseID)
+			if tool == nil && strings.TrimSpace(evt.ToolUseID) == "" {
+				tool = currentTool()
 			}
+			if tool != nil {
+				finishTool(tool, "tool_stop")
+				deleteTool(tool.toolUseID)
+			}
+		case "contextUsage":
+			if evt.ContextUsagePercentage >= 100 {
+				upstreamStopReason = "model_context_window_exceeded"
+			}
+		case "exception":
+			exceptionCount++
+			if evt.ExceptionType == "ContentLengthExceededException" {
+				upstreamStopReason = "max_tokens"
+			}
+			log.WithFields(log.Fields{
+				"event":          "upstream_stream_exception",
+				"request_id":     requestID,
+				"model":          model,
+				"exception_type": evt.ExceptionType,
+			}).Warn("kiro executor: upstream stream exception")
 		}
 	}
 
 	processEvents := func(events []helps.KiroStreamEvent) {
 		for _, evt := range events {
+			now := time.Now()
+			if firstEventMs < 0 {
+				firstEventMs = now.Sub(startedAt).Milliseconds()
+			}
+			if !lastEventAt.IsZero() {
+				longestEventGapMs = maxInt64(longestEventGapMs, now.Sub(lastEventAt).Milliseconds())
+			}
+			lastEventAt = now
 			result.eventCount++
-			emitMessageStart()
 			processEvent(evt)
 		}
 	}
@@ -1483,6 +2232,15 @@ func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *he
 		}
 		n, readErr := body.Read(readBuf)
 		if n > 0 {
+			now := time.Now()
+			if firstReadMs < 0 {
+				firstReadMs = now.Sub(startedAt).Milliseconds()
+			}
+			if !lastReadAt.IsZero() {
+				longestReadGapMs = maxInt64(longestReadGapMs, now.Sub(lastReadAt).Milliseconds())
+			}
+			lastReadAt = now
+			readCount++
 			remaining = append(remaining, readBuf[:n]...)
 			var events []helps.KiroStreamEvent
 			events, remaining = helps.ParseAwsEventStreamBuffer(remaining)
@@ -1515,30 +2273,168 @@ func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *he
 		processEvents(finalEvents)
 		if hasKiroJSONResidue(remaining) {
 			if result.payloadStarted {
+				malformedAfterPayload = true
 				log.Warn("kiro executor: ignoring incomplete trailing JSON event after payload started")
 			} else {
 				return result, newKiroStreamError(helps.KiroErrStreamMalformed, "stream ended with incomplete JSON event", nil)
 			}
 		}
 	}
+	if contentBuffer != "" {
+		if inThinking {
+			emitThinkingDelta(contentBuffer)
+		} else {
+			emitTextDelta(contentBuffer)
+		}
+		contentBuffer = ""
+	}
+	if pendingInitialText != "" && !isKiroClaudeCodeTransientPreamble(strings.TrimSpace(pendingInitialText)) {
+		emitTextDeltaNow(pendingInitialText)
+		pendingInitialText = ""
+	}
+	if pendingInitialText != "" && len(activeTools) > 0 {
+		for _, toolUseID := range toolOrder {
+			if tool, ok := activeTools[toolUseID]; ok {
+				finishTool(tool, "stream_end")
+				deleteTool(toolUseID)
+			}
+		}
+	}
+	if pendingInitialText != "" && !result.payloadStarted {
+		return result, newKiroStreamError(helps.KiroErrStreamMalformed, "stream ended after intention-only preamble", nil)
+	}
 	if result.eventCount == 0 || !result.payloadStarted {
+		if thinkingDeltaCount > 0 || emptyToolUseCount > 0 {
+			durationMs := time.Since(startedAt).Milliseconds()
+			message := fmt.Sprintf(
+				"kiro executor: stream incomplete with no visible content event=stream_incomplete_no_visible_content request_id=%s model=%s duration_ms=%d event_count=%d thinking_delta_count=%d whitespace_text_delta_count=%d empty_tool_use_count=%d dropped_tool_input_bytes=%d",
+				requestID,
+				model,
+				durationMs,
+				result.eventCount,
+				thinkingDeltaCount,
+				whitespaceTextDeltaCount,
+				emptyToolUseCount,
+				droppedToolInputBytes,
+			)
+			log.WithFields(log.Fields{
+				"event":                       "stream_incomplete_no_visible_content",
+				"request_id":                  requestID,
+				"model":                       model,
+				"duration_ms":                 durationMs,
+				"event_count":                 result.eventCount,
+				"thinking_delta_count":        thinkingDeltaCount,
+				"whitespace_text_delta_count": whitespaceTextDeltaCount,
+				"empty_tool_use_count":        emptyToolUseCount,
+				"dropped_tool_input_bytes":    droppedToolInputBytes,
+				"payload_started":             result.payloadStarted,
+			}).Warn(message)
+			return result, newKiroStreamError(helps.KiroErrStreamMalformed, "stream ended without visible content or tool use", nil)
+		}
 		return result, nil
 	}
 
 	// Stop any remaining open blocks.
+	if visibleTextDeltaCount > 0 || toolUseCount > 0 {
+		flushPendingThinking()
+	}
+	synthesizedSummaryClosure := false
+	if !hasToolCalls && (upstreamStopReason == "" || upstreamStopReason == "max_tokens" || upstreamStopReason == "end_turn") && shouldSynthesizeKiroSummaryClosure(model, visibleTextRuneCount, visibleTextTail, continuationAfterIncompleteAssistant, malformedAfterPayload) {
+		emitTextDelta(kiroSummaryClosureText(visibleTextTail))
+		synthesizedSummaryClosure = true
+		upstreamStopReason = ""
+		log.WithFields(log.Fields{
+			"event":                   "stream_synthesized_summary_closure",
+			"request_id":              requestID,
+			"model":                   model,
+			"visible_text_rune_count": visibleTextRuneCount,
+		}).Warn("kiro executor: synthesized concise closure for truncated summary")
+	}
+
 	if thinkingBlockIndex >= 0 {
 		stopBlock(thinkingBlockIndex)
 	}
 	if textBlockIndex >= 0 {
 		stopBlock(textBlockIndex)
 	}
-	if activeTool != nil {
-		stopBlock(activeTool.index)
+	for _, toolUseID := range toolOrder {
+		if tool, ok := activeTools[toolUseID]; ok {
+			finishTool(tool, "stream_end")
+			deleteTool(toolUseID)
+		}
+	}
+	if toolUseCount == 0 && (emptyToolUseCount > 0 || droppedToolInputBytes > 0) {
+		durationMs := time.Since(startedAt).Milliseconds()
+		message := fmt.Sprintf(
+			"kiro executor: stream incomplete tool use event=stream_incomplete_tool_use request_id=%s model=%s duration_ms=%d event_count=%d visible_text_delta_count=%d empty_tool_use_count=%d dropped_tool_input_bytes=%d",
+			requestID,
+			model,
+			durationMs,
+			result.eventCount,
+			visibleTextDeltaCount,
+			emptyToolUseCount,
+			droppedToolInputBytes,
+		)
+		log.WithFields(log.Fields{
+			"event":                    "stream_incomplete_tool_use",
+			"request_id":               requestID,
+			"model":                    model,
+			"duration_ms":              durationMs,
+			"event_count":              result.eventCount,
+			"visible_text_delta_count": visibleTextDeltaCount,
+			"empty_tool_use_count":     emptyToolUseCount,
+			"dropped_tool_input_bytes": droppedToolInputBytes,
+			"payload_started":          result.payloadStarted,
+		}).Warn(message)
+		if visibleTextDeltaCount == 0 {
+			return result, newKiroStreamError(helps.KiroErrStreamMalformed, "stream ended with incomplete tool use", nil)
+		}
+		if !claudeCodeRequest && !kiroVisibleTextEndsWithTerminal(visibleTextTail) {
+			upstreamStopReason = "max_tokens"
+		}
+	}
+	if visibleTextDeltaCount == 0 && toolUseCount == 0 {
+		durationMs := time.Since(startedAt).Milliseconds()
+		message := fmt.Sprintf(
+			"kiro executor: stream incomplete with no visible content event=stream_incomplete_no_visible_content request_id=%s model=%s duration_ms=%d event_count=%d thinking_delta_count=%d whitespace_text_delta_count=%d empty_tool_use_count=%d dropped_tool_input_bytes=%d",
+			requestID,
+			model,
+			durationMs,
+			result.eventCount,
+			thinkingDeltaCount,
+			whitespaceTextDeltaCount,
+			emptyToolUseCount,
+			droppedToolInputBytes,
+		)
+		log.WithFields(log.Fields{
+			"event":                       "stream_incomplete_no_visible_content",
+			"request_id":                  requestID,
+			"model":                       model,
+			"duration_ms":                 durationMs,
+			"event_count":                 result.eventCount,
+			"thinking_delta_count":        thinkingDeltaCount,
+			"whitespace_text_delta_count": whitespaceTextDeltaCount,
+			"empty_tool_use_count":        emptyToolUseCount,
+			"dropped_tool_input_bytes":    droppedToolInputBytes,
+			"payload_started":             result.payloadStarted,
+		}).Warn(message)
+		return result, newKiroStreamError(helps.KiroErrStreamMalformed, "stream ended without visible content or tool use", nil)
 	}
 
 	stopReason := "end_turn"
-	if hasToolCalls {
+	if upstreamStopReason != "" {
+		stopReason = upstreamStopReason
+	} else if hasToolCalls {
 		stopReason = "tool_use"
+	} else if !claudeCodeRequest && !synthesizedSummaryClosure && shouldMarkKiroEndAsMaxTokens(model, visibleTextRuneCount, visibleTextTail, thinkingDeltaCount, continuationAfterIncompleteAssistant) {
+		stopReason = "max_tokens"
+		log.WithFields(log.Fields{
+			"event":                   "stream_suspicious_truncated_end",
+			"request_id":              requestID,
+			"model":                   model,
+			"visible_text_rune_count": visibleTextRuneCount,
+			"thinking_delta_count":    thinkingDeltaCount,
+		}).Warn("kiro executor: mapping suspicious short incomplete end_turn to max_tokens")
 	}
 
 	// message_delta
@@ -1552,7 +2448,309 @@ func streamKiroToClaudeSSE(ctx context.Context, body io.Reader, toolNameMaps *he
 	emitSSE("message_stop", map[string]interface{}{
 		"type": "message_stop",
 	})
+	durationMs := time.Since(startedAt).Milliseconds()
+	summaryMessage := fmt.Sprintf(
+		"kiro executor: stream summary event=stream_summary request_id=%s model=%s duration_ms=%d read_count=%d first_read_ms=%d first_event_ms=%d first_visible_ms=%d first_tool_ms=%d longest_read_gap_ms=%d longest_event_gap_ms=%d longest_visible_gap_ms=%d event_count=%d visible_text_delta_count=%d whitespace_text_delta_count=%d thinking_delta_count=%d tool_use_count=%d tool_input_delta_count=%d empty_tool_use_count=%d exception_count=%d stop_reason=%s max_tool_assemble_ms=%d emitted_tool_input_bytes=%d dropped_tool_input_bytes=%d payload_started=%t",
+		requestID,
+		model,
+		durationMs,
+		readCount,
+		firstReadMs,
+		firstEventMs,
+		firstVisibleMs,
+		firstToolMs,
+		longestReadGapMs,
+		longestEventGapMs,
+		longestVisibleGapMs,
+		result.eventCount,
+		visibleTextDeltaCount,
+		whitespaceTextDeltaCount,
+		thinkingDeltaCount,
+		toolUseCount,
+		toolInputDeltaCount,
+		emptyToolUseCount,
+		exceptionCount,
+		stopReason,
+		maxToolAssembleMs,
+		emittedToolInputBytes,
+		droppedToolInputBytes,
+		result.payloadStarted,
+	)
+	log.WithFields(log.Fields{
+		"event":                       "stream_summary",
+		"request_id":                  requestID,
+		"model":                       model,
+		"duration_ms":                 durationMs,
+		"read_count":                  readCount,
+		"first_read_ms":               firstReadMs,
+		"first_event_ms":              firstEventMs,
+		"first_visible_ms":            firstVisibleMs,
+		"first_tool_ms":               firstToolMs,
+		"longest_read_gap_ms":         longestReadGapMs,
+		"longest_event_gap_ms":        longestEventGapMs,
+		"longest_visible_gap_ms":      longestVisibleGapMs,
+		"event_count":                 result.eventCount,
+		"visible_text_delta_count":    visibleTextDeltaCount,
+		"whitespace_text_delta_count": whitespaceTextDeltaCount,
+		"thinking_delta_count":        thinkingDeltaCount,
+		"tool_use_count":              toolUseCount,
+		"tool_input_delta_count":      toolInputDeltaCount,
+		"empty_tool_use_count":        emptyToolUseCount,
+		"exception_count":             exceptionCount,
+		"stop_reason":                 stopReason,
+		"max_tool_assemble_ms":        maxToolAssembleMs,
+		"emitted_tool_input_bytes":    emittedToolInputBytes,
+		"dropped_tool_input_bytes":    droppedToolInputBytes,
+		"payload_started":             result.payloadStarted,
+	}).Info(summaryMessage)
+	if firstVisibleMs > kiroVisibleGapWarningThresholdMs || longestVisibleGapMs > kiroVisibleGapWarningThresholdMs {
+		log.WithFields(log.Fields{
+			"event":                  "visible_gap_warning",
+			"request_id":             requestID,
+			"model":                  model,
+			"duration_ms":            durationMs,
+			"first_visible_ms":       firstVisibleMs,
+			"longest_visible_gap_ms": longestVisibleGapMs,
+			"stop_reason":            stopReason,
+			"payload_started":        result.payloadStarted,
+		}).Warn("kiro executor: long gap before user-visible stream output")
+	}
 	return result, nil
+}
+
+const kiroVisibleGapWarningThresholdMs int64 = 15000
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func appendKiroVisibleTextTail(tail, text string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(tail + text)
+	if len(runes) <= maxRunes {
+		return string(runes)
+	}
+	return string(runes[len(runes)-maxRunes:])
+}
+
+func shouldMarkKiroEndAsMaxTokens(model string, visibleRuneCount int, visibleTail string, thinkingDeltaCount int, continuationAfterIncompleteAssistant bool) bool {
+	trimmed := strings.TrimSpace(visibleTail)
+	if trimmed == "" {
+		return false
+	}
+	if !isKiroOpusModel(model) {
+		return false
+	}
+	runes := []rune(trimmed)
+	last := runes[len(runes)-1]
+	if isKiroIntentionOnlyAnswer(trimmed) {
+		return true
+	}
+	if isKiroMarkdownHeadingFragment(trimmed) {
+		return true
+	}
+	if strings.ContainsRune("。.!?！？…」』）)]}》\"'`”’", last) {
+		return false
+	}
+	if last == '|' {
+		return false
+	}
+	if strings.ContainsRune("，,、：:；;", last) {
+		return visibleRuneCount >= 2
+	}
+	if continuationAfterIncompleteAssistant {
+		return true
+	}
+	if visibleRuneCount < 4 {
+		return false
+	}
+	if hasUnclosedKiroMarkdownFence(trimmed) || hasUnclosedKiroDelimiter(trimmed) {
+		return true
+	}
+	if visibleRuneCount >= 40 {
+		return true
+	}
+	return thinkingDeltaCount > 0 && visibleRuneCount >= 8 && visibleRuneCount <= 80
+}
+
+func shouldSynthesizeKiroSummaryClosure(model string, visibleRuneCount int, visibleTail string, continuationAfterIncompleteAssistant bool, malformedAfterPayload bool) bool {
+	if (!continuationAfterIncompleteAssistant && !malformedAfterPayload) || !isKiroOpusModel(model) || visibleRuneCount < 80 {
+		return false
+	}
+	trimmed := strings.TrimSpace(visibleTail)
+	if trimmed == "" || kiroVisibleTextEndsWithTerminal(trimmed) {
+		return false
+	}
+	if strings.HasPrefix(trimmed, "以上") {
+		return true
+	}
+	return strings.Count(trimmed, "starrocks-") >= 5 || strings.Count(trimmed, "**") >= 6
+}
+
+func kiroSummaryClosureText(visibleTail string) string {
+	trimmed := strings.TrimSpace(visibleTail)
+	if strings.HasSuffix(trimmed, "以上") {
+		return "为工作区模块功能概览。"
+	}
+	if strings.Contains(visibleTail, "starrocks-profile") || strings.Contains(visibleTail, "starrocks-ops-mcp") {
+		return "；其他模块包括 starrocks-aiops、starrocks-gc-detector、starrocks-diagnostics-skills、starrocks-approval、starrocks-board、starrocks-cluster、starrocks-realtime-monitor、starrocks-skills、starrocks-experience-docs 等。以上为工作区模块功能概览。"
+	}
+	return "。以上为工作区模块功能概览。"
+}
+
+func isKiroIntentionOnlyAnswer(text string) bool {
+	runes := []rune(text)
+	if len(runes) == 0 || len(runes) > 160 {
+		return false
+	}
+	if strings.Contains(text, "我来") {
+		return strings.Contains(text, "探索") || strings.Contains(text, "了解") || strings.Contains(text, "读取")
+	}
+	if strings.Contains(text, "让我") {
+		return strings.Contains(text, "探索") || strings.Contains(text, "了解") || strings.Contains(text, "读取") || strings.Contains(text, "验证") || strings.Contains(text, "补充") || strings.Contains(text, "查看") || strings.Contains(text, "分析")
+	}
+	return false
+}
+
+func isKiroClaudeCodeTransientPreamble(text string) bool {
+	return isKiroIntentionOnlyAnswer(text) || isKiroCompletionOnlyPreamble(text)
+}
+
+func isKiroCompletionOnlyPreamble(text string) bool {
+	runes := []rune(text)
+	if len(runes) == 0 || len(runes) > 160 {
+		return false
+	}
+	for _, phrase := range []string{"探索完成", "读取完成", "分析完成", "检查完成", "梳理完成"} {
+		if strings.Contains(text, phrase) {
+			return !strings.Contains(text, "starrocks-")
+		}
+	}
+	return false
+}
+
+func isKiroPossibleClaudeCodeTransientPreamblePrefix(text string) bool {
+	runes := []rune(text)
+	if len(runes) == 0 || len(runes) > 160 {
+		return false
+	}
+	for _, starter := range []string{"我来", "让我"} {
+		if strings.HasPrefix(starter, text) {
+			return true
+		}
+		if strings.HasPrefix(text, starter) {
+			return !kiroVisibleTextEndsWithTerminal(text)
+		}
+	}
+	for _, phrase := range []string{"探索完成", "读取完成", "分析完成", "检查完成", "梳理完成"} {
+		if strings.HasPrefix(phrase, text) {
+			return true
+		}
+	}
+	return false
+}
+
+func isKiroMarkdownHeadingFragment(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	return trimmed == "#" || trimmed == "##" || trimmed == "###" || trimmed == "####"
+}
+
+func isKiroOpusModel(model string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(model)), "opus")
+}
+
+func kiroRequestHasIncompleteAssistantTail(body []byte) bool {
+	messages := gjson.GetBytes(body, "messages").Array()
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Get("role").String() != "assistant" {
+			continue
+		}
+		return kiroVisibleTextLooksIncomplete(kiroClaudeMessageVisibleText(msg.Get("content")))
+	}
+	return false
+}
+
+func kiroClaudeMessageVisibleText(content gjson.Result) string {
+	if content.Type == gjson.String {
+		return content.String()
+	}
+	var b strings.Builder
+	for _, block := range content.Array() {
+		if block.Get("type").String() == "text" {
+			b.WriteString(block.Get("text").String())
+		}
+	}
+	return b.String()
+}
+
+func kiroVisibleTextLooksIncomplete(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	runes := []rune(trimmed)
+	last := runes[len(runes)-1]
+	if strings.ContainsRune("。.!?！？…」』）)]}》\"'`”’|", last) {
+		return false
+	}
+	if strings.ContainsRune("，,、：:；;", last) {
+		return true
+	}
+	if hasUnclosedKiroMarkdownFence(trimmed) || hasUnclosedKiroDelimiter(trimmed) {
+		return true
+	}
+	return len(runes) >= 4
+}
+
+func kiroVisibleTextEndsWithTerminal(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	runes := []rune(trimmed)
+	last := runes[len(runes)-1]
+	return strings.ContainsRune("。.!?！？…」』）)]}》\"'`”’|", last)
+}
+
+func hasUnclosedKiroMarkdownFence(s string) bool {
+	return strings.Count(s, "```")%2 == 1
+}
+
+func hasUnclosedKiroDelimiter(s string) bool {
+	pairs := [][2]string{
+		{"（", "）"},
+		{"(", ")"},
+		{"[", "]"},
+		{"【", "】"},
+		{"《", "》"},
+		{"「", "」"},
+		{"“", "”"},
+	}
+	for _, pair := range pairs {
+		if strings.Count(s, pair[0]) > strings.Count(s, pair[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func longestSuffixPrefixLen(s, prefix string) int {
+	maxLen := len(prefix) - 1
+	if len(s) < maxLen {
+		maxLen = len(s)
+	}
+	for n := maxLen; n > 0; n-- {
+		if strings.HasSuffix(s, prefix[:n]) {
+			return n
+		}
+	}
+	return 0
 }
 
 func contextErr(ctx context.Context) error {

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
@@ -234,6 +235,30 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
+	streamCommitted := false
+	commitStream := func(includeUpstreamHeaders bool) {
+		if streamCommitted {
+			return
+		}
+		setSSEHeaders()
+		if includeUpstreamHeaders {
+			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		}
+		streamCommitted = true
+	}
+	writeKeepAlive := func() {
+		commitStream(false)
+		_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+		flusher.Flush()
+	}
+	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
+	var keepAlive *time.Ticker
+	var keepAliveC <-chan time.Time
+	if keepAliveInterval > 0 {
+		keepAlive = time.NewTicker(keepAliveInterval)
+		defer keepAlive.Stop()
+		keepAliveC = keepAlive.C
+	}
 
 	// Peek at the first chunk to determine success or failure before setting headers
 	for {
@@ -248,7 +273,13 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 				continue
 			}
 			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
+			if streamCommitted {
+				errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+				_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+				flusher.Flush()
+			} else {
+				h.WriteErrorResponse(c, errMsg)
+			}
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -258,16 +289,14 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		case chunk, ok := <-dataChan:
 			if !ok {
 				// Stream closed without data? Send DONE or just headers.
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				commitStream(true)
 				flusher.Flush()
 				cliCancel(nil)
 				return
 			}
 
 			// Success! Set headers now.
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			commitStream(true)
 
 			// Write the first chunk
 			if len(chunk) > 0 {
@@ -278,6 +307,8 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			// Continue streaming the rest
 			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
+		case <-keepAliveC:
+			writeKeepAlive()
 		}
 	}
 }

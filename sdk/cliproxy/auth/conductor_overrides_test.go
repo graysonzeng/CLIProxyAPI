@@ -108,6 +108,32 @@ func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing
 	}
 }
 
+func TestManager_ShouldRetryAfterError_RetriesCloudflare524RetryAfter(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 30*time.Second, 0)
+
+	auth := &Auth{
+		ID:       "auth-524",
+		Provider: "kiro",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	_, _, maxWait := m.retrySettings()
+	wait, shouldRetry := m.shouldRetryAfterError(&retryAfterStatusError{
+		status:     524,
+		message:    "origin_response_timeout",
+		retryAfter: 2 * time.Second,
+	}, 0, []string{"kiro"}, "claude-opus-4-6", maxWait)
+	if !shouldRetry {
+		t.Fatalf("expected shouldRetry=true for 524 retry_after, got false")
+	}
+	if wait != 2*time.Second {
+		t.Fatalf("wait = %v, want 2s", wait)
+	}
+}
+
 type credentialRetryLimitExecutor struct {
 	id string
 

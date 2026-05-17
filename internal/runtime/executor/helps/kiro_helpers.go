@@ -56,8 +56,24 @@ const (
 )
 
 // KiroModelMapping maps client-facing model IDs to upstream Kiro (CodeWhisperer) model IDs.
+//
+// The map MUST stay in sync with the kiro section of
+// internal/registry/models/models.json: the registry decides whether a request
+// can be routed to Kiro at all (see internal/util.GetProviderName), and this
+// map decides how that routed request is translated for the upstream API.
+// Missing a date-suffixed alias here while exposing it in the registry
+// surfaces as 502 "unknown provider for model" for Claude Code, since Claude
+// Code uses the dated form by default for auto-routed light-tier traffic
+// (completion summary, telemetry, internal subagent calls).
+//
+// Keep the explicit, undated Haiku alias mapped to Kiro Haiku for operators
+// that choose it directly. The dated Haiku alias is Claude Code's auto-routed
+// light-tier model, and is intentionally upgraded to Sonnet 4.6 because Kiro
+// Haiku frequently emits incomplete tool input shards that Claude Code cannot
+// execute reliably.
 var KiroModelMapping = map[string]string{
 	"claude-haiku-4-5":           "claude-haiku-4.5",
+	"claude-haiku-4-5-20251001":  "claude-sonnet-4.6",
 	"claude-opus-4-7":            "claude-opus-4.7",
 	"claude-opus-4-6":            "claude-opus-4.6",
 	"claude-sonnet-4-6":          "claude-sonnet-4.6",
@@ -65,6 +81,31 @@ var KiroModelMapping = map[string]string{
 	"claude-opus-4-5-20251101":   "claude-opus-4.5",
 	"claude-sonnet-4-5":          "claude-sonnet-4.5",
 	"claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
+}
+
+// kiroAdaptiveLevelsModels is the set of upstream CodeWhisperer model ids
+// that understand the <thinking_mode>adaptive</thinking_mode> +
+// <thinking_effort>low|medium|high</thinking_effort> protocol. Older Kiro
+// tiers (haiku 4.5, sonnet 4.5, opus 4.5) only honor enabled/disabled
+// thinking; sending adaptive prefixes to them is silently ignored or coerced
+// upstream, while still costing the request a thinking pass we can't
+// observe. See KiroSupportsAdaptiveLevels.
+var kiroAdaptiveLevelsModels = map[string]struct{}{
+	"claude-sonnet-4.6": {},
+	"claude-opus-4.6":   {},
+	"claude-opus-4.7":   {},
+}
+
+// KiroSupportsAdaptiveLevels reports whether the upstream CodeWhisperer model
+// id (the value returned by MapKiroModel, NOT the client-facing alias)
+// understands adaptive thinking with effort levels. Used by
+// kiro_executor.buildKiroCodeWhispererRequest to skip the proxy's default
+// `enabled+budget → adaptive+effort` rewrite on lighter tiers, where the
+// rewrite would just slow the request down without producing usable
+// reasoning content.
+func KiroSupportsAdaptiveLevels(upstreamModel string) bool {
+	_, ok := kiroAdaptiveLevelsModels[strings.TrimSpace(upstreamModel)]
+	return ok
 }
 
 // KiroUsageLimitsURL builds the Kiro quota endpoint URL.
@@ -237,9 +278,13 @@ var (
 // paths still need a fresh transport (see kiro_executor.httpClientFor).
 //
 // Tuning rationale:
-//   - MaxIdleConnsPerHost=8: Kiro typically routes traffic from a small set of
-//     accounts to one AWS region. 8 idle conns per host is enough to absorb
-//     bursty Claude Code multi-turn sessions without holding excessive sockets.
+//   - MaxIdleConnsPerHost=16: Kiro typically routes traffic from a small set
+//     of accounts to one AWS region. 16 idle conns per host gives Claude
+//     Code subagent fan-outs of 8+ concurrent requests room to multiplex
+//     across HTTP/2 streams without forcing the transport to dial a fresh
+//     TCP+TLS connection mid-burst (which surfaced as a ~1.4s p99 TTFT
+//     outlier on 8x concurrent benchmark runs at the previous 8 cap).
+//     16 idle sockets is still trivial: ~8 fds per active region.
 //   - IdleConnTimeout=5m: AWS LB idle timeout is 60s by default; 5m on the
 //     client side combined with the LB timeout means the client may send a
 //     request on a half-closed conn occasionally and transparently retry.
@@ -265,7 +310,7 @@ func KiroSharedHTTPClient() *http.Client {
 			Proxy:                 http.ProxyFromEnvironment,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          64,
-			MaxIdleConnsPerHost:   8,
+			MaxIdleConnsPerHost:   16,
 			IdleConnTimeout:       5 * time.Minute,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
@@ -317,7 +362,7 @@ func KiroBaseURL(region string) string {
 
 // KiroStreamEvent represents a parsed event from the Kiro AWS Event Stream.
 type KiroStreamEvent struct {
-	Type string // "content", "toolUse", "toolUseInput", "toolUseStop", "contextUsage"
+	Type string // "content", "toolUse", "toolUseInput", "toolUseStop", "contextUsage", "exception"
 	// Content holds the text for "content" events.
 	Content string
 	// ToolUse fields (populated for toolUse/toolUseInput/toolUseStop events).
@@ -327,6 +372,9 @@ type KiroStreamEvent struct {
 	ToolStop  bool
 	// ContextUsage fields.
 	ContextUsagePercentage float64
+	// Exception fields.
+	ExceptionType string
+	Message       string
 }
 
 // ParseAwsEventStreamBuffer extracts JSON events from an AWS Event Stream buffer.
@@ -418,7 +466,23 @@ func ParseAwsEventStreamBuffer(buffer []byte) (events []KiroStreamEvent, remaini
 	if searchStart > 0 && len(remaining) > 0 {
 		remaining = remaining[searchStart:]
 	}
+	if evt := classifyKiroRawException(remaining); evt != nil {
+		events = append(events, *evt)
+		remaining = remaining[len(remaining):]
+	}
 	return events, remaining
+}
+
+func classifyKiroRawException(raw []byte) *KiroStreamEvent {
+	if len(raw) == 0 {
+		return nil
+	}
+	switch {
+	case bytes.Contains(raw, []byte("ContentLengthExceededException")):
+		return &KiroStreamEvent{Type: "exception", ExceptionType: "ContentLengthExceededException", Message: string(raw)}
+	default:
+		return nil
+	}
 }
 
 func classifyKiroEvent(parsed map[string]json.RawMessage) *KiroStreamEvent {
@@ -478,11 +542,16 @@ func classifyKiroEvent(parsed map[string]json.RawMessage) *KiroStreamEvent {
 
 	// toolUseStop: has stop but no contextUsagePercentage
 	if hasStop && !hasContextUsage {
+		var toolUseID string
+		if raw, ok := parsed["toolUseId"]; ok {
+			_ = json.Unmarshal(raw, &toolUseID)
+		}
 		var stop bool
 		_ = json.Unmarshal(parsed["stop"], &stop)
 		return &KiroStreamEvent{
-			Type:     "toolUseStop",
-			ToolStop: stop,
+			Type:      "toolUseStop",
+			ToolUseID: toolUseID,
+			ToolStop:  stop,
 		}
 	}
 
@@ -775,6 +844,11 @@ func ClassifyKiroHTTPStatus(status int, body []byte, header http.Header) *KiroEr
 		classified.Class = KiroErrServer
 	case status >= 500 && status < 600:
 		classified.Class = KiroErrServer
+		if d := parseRetryAfterHeader(header); d != nil {
+			classified.retryAfter = d
+		} else if d := parseRetryAfterBody(body); d != nil {
+			classified.retryAfter = d
+		}
 	default:
 		classified.Class = KiroErrUnknown
 	}
@@ -846,10 +920,68 @@ func parseRetryAfterHeader(header http.Header) *time.Duration {
 	return nil
 }
 
+func parseRetryAfterBody(body []byte) *time.Duration {
+	var parsed interface{}
+	if len(bytes.TrimSpace(body)) == 0 || json.Unmarshal(body, &parsed) != nil {
+		return nil
+	}
+	seconds, ok := findRetryAfterSeconds(parsed)
+	if !ok || seconds <= 0 {
+		return nil
+	}
+	d := time.Duration(seconds) * time.Second
+	return &d
+}
+
+func findRetryAfterSeconds(value interface{}) (float64, bool) {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		for key, child := range v {
+			normalized := strings.ToLower(strings.ReplaceAll(key, "-", "_"))
+			if normalized == "retry_after" || normalized == "retryafter" {
+				if seconds, ok := retryAfterSecondsValue(child); ok {
+					return seconds, true
+				}
+			}
+			if seconds, ok := findRetryAfterSeconds(child); ok {
+				return seconds, true
+			}
+		}
+	case []interface{}:
+		for _, child := range v {
+			if seconds, ok := findRetryAfterSeconds(child); ok {
+				return seconds, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func retryAfterSecondsValue(value interface{}) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case string:
+		seconds, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		return seconds, err == nil
+	default:
+		return 0, false
+	}
+}
+
 // SanitizeToolInput removes empty-string keys from a tool input map.
+//
+// Empty input (nil or zero-length) is replaced with `{}` so that the value can
+// always be safely embedded in a JSON payload as a `json.RawMessage`. Without
+// this fallback, marshaling a struct that contains an empty json.RawMessage
+// fails with `json: error calling MarshalJSON for type json.RawMessage:
+// unexpected end of JSON input`, which would block buildKiroAssistantHistoryMessage
+// from serializing a prior assistant turn whose tool_use block did not carry an
+// explicit `input` field. The empty-object placeholder matches the Anthropic
+// Messages API contract for tool_use blocks (`input` is always an object).
 func SanitizeToolInput(input json.RawMessage) json.RawMessage {
 	if len(input) == 0 {
-		return input
+		return json.RawMessage("{}")
 	}
 	var m map[string]interface{}
 	if err := json.Unmarshal(input, &m); err != nil {
