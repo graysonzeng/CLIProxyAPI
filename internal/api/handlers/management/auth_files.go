@@ -1371,6 +1371,7 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 		auth.StatusMessage = "removed via management API"
 		auth.UpdatedAt = time.Now()
 		_, _ = h.authManager.Update(ctx, auth)
+		h.reconcileCodexQueue(ctx, auth)
 		return
 	}
 	authID := h.authIDForPath(id)
@@ -1383,6 +1384,7 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 		auth.StatusMessage = "removed via management API"
 		auth.UpdatedAt = time.Now()
 		_, _ = h.authManager.Update(ctx, auth)
+		h.reconcileCodexQueue(ctx, auth)
 	}
 }
 
@@ -1427,7 +1429,84 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
-	return store.Save(ctx, record)
+	savedPath, err := store.Save(ctx, record)
+	if err != nil {
+		return "", err
+	}
+	if err := h.syncSavedTokenRecord(ctx, savedPath, record); err != nil {
+		return "", err
+	}
+	return savedPath, nil
+}
+
+func (h *Handler) syncSavedTokenRecord(ctx context.Context, savedPath string, record *coreauth.Auth) error {
+	if h == nil || h.authManager == nil || record == nil {
+		return nil
+	}
+
+	auth, err := h.authFromSavedTokenRecord(savedPath, record)
+	if err != nil {
+		return err
+	}
+	if auth == nil {
+		return nil
+	}
+	if err := h.upsertAuthRecord(coreauth.WithSkipPersist(ctx), auth); err != nil {
+		return err
+	}
+	h.reconcileCodexQueue(ctx, auth)
+	return nil
+}
+
+func (h *Handler) authFromSavedTokenRecord(savedPath string, record *coreauth.Auth) (*coreauth.Auth, error) {
+	if path := strings.TrimSpace(savedPath); path != "" {
+		if data, err := os.ReadFile(path); err == nil {
+			return h.buildAuthFromFileData(path, data)
+		} else if filepath.IsAbs(path) {
+			return nil, fmt.Errorf("failed to read saved auth file: %w", err)
+		}
+	}
+
+	auth := record.Clone()
+	if auth == nil {
+		return nil, nil
+	}
+	auth.Disabled = false
+	auth.Status = coreauth.StatusActive
+	auth.StatusMessage = ""
+	auth.UpdatedAt = time.Now()
+	if auth.CreatedAt.IsZero() {
+		auth.CreatedAt = auth.UpdatedAt
+	}
+	if strings.TrimSpace(auth.ID) == "" {
+		auth.ID = strings.TrimSpace(savedPath)
+	}
+	if strings.TrimSpace(auth.FileName) == "" {
+		auth.FileName = auth.ID
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	if path := strings.TrimSpace(savedPath); path != "" {
+		auth.Attributes["path"] = path
+		auth.Attributes["source"] = path
+	}
+	coreauth.ApplyCustomHeadersFromMetadata(auth)
+	return auth, nil
+}
+
+func (h *Handler) reconcileCodexQueue(ctx context.Context, auth *coreauth.Auth) {
+	if h == nil || h.authManager == nil || auth == nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return
+	}
+	coordinator := h.authManager.CodexQueueCoordinator()
+	if coordinator == nil || !coordinator.Enabled() {
+		return
+	}
+	coordinator.ReconcileNow(ctx)
 }
 
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
