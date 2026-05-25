@@ -663,6 +663,12 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
+		if isUnsupportedClaudeCountTokensEndpoint(resp.StatusCode, b) {
+			count := estimateClaudeCountTokens(baseModel, body)
+			data := []byte(fmt.Sprintf(`{"input_tokens":%d}`, count))
+			out := sdktranslator.TranslateTokenCount(ctx, to, from, count, data)
+			return cliproxyexecutor.Response{Payload: out, Headers: resp.Header.Clone()}, nil
+		}
 		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(b)}
 	}
 	decodedBody, err := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
@@ -687,6 +693,33 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	count := gjson.GetBytes(data, "input_tokens").Int()
 	out := sdktranslator.TranslateTokenCount(ctx, to, from, count, data)
 	return cliproxyexecutor.Response{Payload: out, Headers: resp.Header.Clone()}, nil
+}
+
+func isUnsupportedClaudeCountTokensEndpoint(status int, body []byte) bool {
+	if status != http.StatusNotFound {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "invalid url") &&
+		strings.Contains(lower, "/v1/messages/count_tokens")
+}
+
+func estimateClaudeCountTokens(model string, body []byte) int64 {
+	enc, err := helps.TokenizerForModel(model)
+	if err == nil {
+		if count, countErr := helps.CountOpenAIChatTokens(enc, body); countErr == nil && count > 0 {
+			return count
+		}
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return 1
+	}
+	count := int64(len([]rune(trimmed))/4 + 1)
+	if count < 1 {
+		return 1
+	}
+	return count
 }
 
 func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
