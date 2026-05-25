@@ -50,6 +50,12 @@ func (schedulerTestExecutor) HttpRequest(ctx context.Context, auth *Auth, req *h
 	return nil, nil
 }
 
+type codexSchedulerTestExecutor struct {
+	schedulerTestExecutor
+}
+
+func (codexSchedulerTestExecutor) Identifier() string { return "codex" }
+
 type trackingSelector struct {
 	calls      int
 	lastAuthID []string
@@ -336,6 +342,69 @@ func TestSchedulerPick_CodexQueueModeOnlyPicksActive(t *testing.T) {
 		if got.ID != activeID {
 			t.Fatalf("pickSingle #%d returned %q, expected only active %q while queue mode is on", i, got.ID, activeID)
 		}
+	}
+}
+
+func TestManagerPickNext_CodexQueueLowQuotaRoutesNewRequestsButAllowsPinnedOldAuth(t *testing.T) {
+	// Cannot run in parallel: this test mutates package-level queue checkers.
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(codexSchedulerTestExecutor{})
+	coordinator := manager.EnsureCodexQueueCoordinator()
+	coordinator.activeRefreshEvery = 0
+	coordinator.standbyRefreshEvery = 0
+	t.Cleanup(func() {
+		coordinator.Stop()
+		SetQueueManagedDisabledChecker(nil)
+		SetQueueRoutingBlockedChecker(nil)
+		SetQueueRealRequestRecorder(nil)
+	})
+
+	a1 := newQueueTestAuth("codex-a-low", "team")
+	a2 := newQueueTestAuth("codex-b-fresh", "team")
+	registerQueueTestAuths(t, manager, a1, a2)
+	registerSchedulerModels(t, "codex", "gpt-5.3-codex", a1.ID, a2.ID)
+	manager.RefreshSchedulerEntry(a1.ID)
+	manager.RefreshSchedulerEntry(a2.ID)
+
+	now := time.Date(2026, 5, 17, 11, 0, 0, 0, time.UTC)
+	coordinator.now = func() time.Time { return now }
+	cfg := defaultQueueConfigForSchedulerTest(true)
+	cfg.IdleWindow = "10m"
+	cfg.Normalize()
+	coordinator.ApplyConfig(cfg)
+
+	quotas := map[string]float64{a1.ID: 80, a2.ID: 80}
+	coordinator.SetProvider(CodexQueueQuotaProviderFunc(func(ctx context.Context, auth *Auth) (CodexQuotaSnapshot, error) {
+		return knownQuota(quotas[auth.ID]), nil
+	}))
+
+	coordinator.Reconcile(context.Background())
+	groups := coordinator.Groups()
+	if len(groups) != 1 || groups[0].ActiveAuthID != a1.ID {
+		t.Fatalf("initial queue group = %+v, want active %q", groups, a1.ID)
+	}
+
+	coordinator.RecordRealRequest(a1.ID, now)
+	quotas[a1.ID] = 2
+	now = now.Add(30 * time.Second)
+	coordinator.Reconcile(context.Background())
+
+	newRequestAuth, errPick := manager.scheduler.pickSingle(context.Background(), "codex", "gpt-5.3-codex", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("new request pick error = %v", errPick)
+	}
+	if newRequestAuth == nil || newRequestAuth.ID != a2.ID {
+		t.Fatalf("new request auth = %v, want %q", newRequestAuth, a2.ID)
+	}
+
+	pinnedAuth, _, errPinned := manager.pickNext(context.Background(), "codex", "gpt-5.3-codex", cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: a1.ID},
+	}, nil)
+	if errPinned != nil {
+		t.Fatalf("pinned old request pick error = %v", errPinned)
+	}
+	if pinnedAuth == nil || pinnedAuth.ID != a1.ID {
+		t.Fatalf("pinned old request auth = %v, want %q", pinnedAuth, a1.ID)
 	}
 }
 

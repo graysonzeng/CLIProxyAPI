@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
@@ -208,12 +209,40 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
+	h.syncCodexQueueQuotaFromAPICall(auth, parsedURL, resp.StatusCode, respBody)
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,
 		Body:       string(respBody),
 	})
+}
+
+func (h *Handler) syncCodexQueueQuotaFromAPICall(auth *coreauth.Auth, parsedURL *url.URL, statusCode int, body []byte) {
+	if h == nil || h.authManager == nil || auth == nil || parsedURL == nil {
+		return
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(parsedURL.Path), "/backend-api/wham/usage") {
+		return
+	}
+	coordinator := h.authManager.CodexQueueCoordinator()
+	if coordinator == nil || !coordinator.Enabled() {
+		return
+	}
+	var parsed helps.CodexUsageResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		log.WithError(err).Debug("management APICall codex quota sync skipped: decode failed")
+		return
+	}
+	snapshot := helps.CodexUsageResponseToQuotaSnapshot(parsed)
+	snapshot.Source = "management/api-call"
+	coordinator.UpdateQuotaSnapshot(auth.ID, snapshot)
 }
 
 func firstNonEmptyString(values ...*string) string {

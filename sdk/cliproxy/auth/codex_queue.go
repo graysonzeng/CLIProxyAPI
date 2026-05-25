@@ -324,6 +324,47 @@ func (c *CodexQueueCoordinator) ReconcileNow(ctx context.Context) {
 	c.Reconcile(ctx)
 }
 
+// UpdateQuotaSnapshot writes a freshly fetched quota snapshot for one auth and
+// immediately reevaluates queue routing. It is used by management quota probes
+// so operator-triggered refreshes and the runtime queue share the same state.
+func (c *CodexQueueCoordinator) UpdateQuotaSnapshot(authID string, snapshot CodexQuotaSnapshot) bool {
+	if c == nil {
+		return false
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" || !c.Enabled() {
+		return false
+	}
+	auths := c.snapshotAuths()
+	cfg := c.Config()
+	c.rebuildGroups(auths, cfg)
+
+	now := c.now()
+	if snapshot.FetchedAt.IsZero() {
+		snapshot.FetchedAt = now
+	}
+	if snapshot.Source == "" {
+		snapshot.Source = "manual"
+	}
+	if snapshot.Status == "" {
+		snapshot.Status = CodexQuotaStatusKnown
+	}
+	snapshot.Stale = false
+
+	c.mu.Lock()
+	state := c.states[authID]
+	if state == nil {
+		c.mu.Unlock()
+		return false
+	}
+	state.Quota = snapshot
+	c.mu.Unlock()
+
+	dirty := c.evaluateState(cfg)
+	c.pushSchedulerUpdatesForAuthIDs(dirty)
+	return true
+}
+
 func (c *CodexQueueCoordinator) snapshotAuths() []*Auth {
 	if c == nil || c.manager == nil {
 		return nil
@@ -422,6 +463,9 @@ func (c *CodexQueueCoordinator) rebuildGroups(auths []*Auth, cfg internalconfig.
 			}
 			if state.QueueManagedDisabled {
 				state.QueueState = CodexQueueStateManagedDisabled
+				continue
+			}
+			if state.QueueState == CodexQueueStateSwitchPending && isLowQuota(state.Quota, cfg.ThresholdPercent) {
 				continue
 			}
 			// Default non-active members to standby. evaluateState refines
@@ -561,6 +605,16 @@ func (c *CodexQueueCoordinator) evaluateState(cfg internalconfig.CodexQueueConfi
 			if c.groupActive[groupKey] == id {
 				continue
 			}
+			if state.QueueState == CodexQueueStateSwitchPending && isLowQuota(state.Quota, threshold) {
+				if autoDisable && codexQueueIdleElapsed(state, now, idleWindow) {
+					state.QueueManagedDisabled = true
+					state.QueueDisabledReason = CodexQueueDisableReasonLowQuota
+					state.RecoveryReadyAt = time.Time{}
+					state.QueueState = CodexQueueStateManagedDisabled
+					continue
+				}
+				continue
+			}
 			if state.QueueManagedDisabled {
 				if queueRecoveryEligible(state, threshold, c.manualDisabled[id]) {
 					state.QueueManagedDisabled = false
@@ -633,22 +687,14 @@ func (c *CodexQueueCoordinator) evaluateState(cfg internalconfig.CodexQueueConfi
 			c.groupUpdatedAt[groupKey] = now
 			continue
 		}
-		idleElapsed := false
-		if activeState.LastRealRequestAt.IsZero() {
-			// Treat zero last-request as "active just registered"; require a
-			// full idle window before switching to avoid early flapping.
-			idleElapsed = now.Sub(activeState.SwitchPendingSince) >= idleWindow
-		} else {
-			idleElapsed = now.Sub(activeState.LastRealRequestAt) >= idleWindow
-		}
-		if !idleElapsed {
-			c.groupReason[groupKey] = CodexQueueSwitchReasonAwaitingIdle
+		candidate := c.firstPromotableLocked(groupKey, activeID, cfg, false)
+		idleElapsed := codexQueueIdleElapsed(activeState, now, idleWindow)
+		if candidate == "" && !idleElapsed {
+			c.groupReason[groupKey] = CodexQueueSwitchReasonNoCandidate
 			c.groupUpdatedAt[groupKey] = now
 			continue
 		}
-
-		candidate := c.firstPromotableLocked(groupKey, activeID, cfg, false)
-		if autoDisable {
+		if autoDisable && idleElapsed {
 			activeState.QueueManagedDisabled = true
 			activeState.QueueDisabledReason = CodexQueueDisableReasonLowQuota
 			activeState.RecoveryReadyAt = time.Time{}
@@ -675,7 +721,7 @@ func (c *CodexQueueCoordinator) evaluateState(cfg internalconfig.CodexQueueConfi
 			groupKey: groupKey,
 			from:     activeID,
 			to:       candidate,
-			reason:   CodexQueueDisableReasonLowQuota,
+			reason:   CodexQueueSwitchReasonLowQuota,
 		})
 	}
 	// Clean up state entries for non-existent groups.
@@ -998,6 +1044,16 @@ func queueRecoveryEligible(state *CodexQueueAuthState, threshold float64, manual
 		!state.Quota.Stale &&
 		!isLowQuota(state.Quota, threshold) &&
 		!manualDisabled
+}
+
+func codexQueueIdleElapsed(state *CodexQueueAuthState, now time.Time, idleWindow time.Duration) bool {
+	if state == nil {
+		return false
+	}
+	if state.LastRealRequestAt.IsZero() {
+		return !state.SwitchPendingSince.IsZero() && now.Sub(state.SwitchPendingSince) >= idleWindow
+	}
+	return now.Sub(state.LastRealRequestAt) >= idleWindow
 }
 
 // isLowQuota reports whether any known window's percent-remaining falls below

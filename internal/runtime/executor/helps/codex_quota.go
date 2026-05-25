@@ -119,11 +119,20 @@ func NewCodexQueueQuotaProvider(cfgGetter func() *config.Config) cliproxyauth.Co
 			return snapshot, fmt.Errorf("codex quota probe: decode failed: %w", err)
 		}
 
-		snapshot.PrimaryWindow = convertCodexUsageWindow(parsed.RateLimit.PrimaryWindow)
-		snapshot.SecondaryWindow = convertCodexUsageWindow(parsed.RateLimit.SecondaryWindow)
-		snapshot.Status = cliproxyauth.CodexQuotaStatusKnown
+		snapshot = CodexUsageResponseToQuotaSnapshot(parsed)
 		return snapshot, nil
 	})
+}
+
+// CodexUsageResponseToQuotaSnapshot converts a wham/usage payload into the
+// queue coordinator's runtime quota snapshot shape.
+func CodexUsageResponseToQuotaSnapshot(parsed CodexUsageResponse) cliproxyauth.CodexQuotaSnapshot {
+	return cliproxyauth.CodexQuotaSnapshot{
+		PrimaryWindow:   convertCodexUsageWindow(parsed.RateLimit.PrimaryWindow),
+		SecondaryWindow: convertCodexUsageWindow(parsed.RateLimit.SecondaryWindow),
+		Source:          "wham/usage",
+		Status:          cliproxyauth.CodexQuotaStatusKnown,
+	}
 }
 
 func convertCodexUsageWindow(w CodexUsageWindow) cliproxyauth.QuotaWindowSnapshot {

@@ -128,7 +128,10 @@ routing:
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
-  # Optional Codex OAuth queue mode. Only one auth in an equivalent group is routed at a time.
+  # Optional Codex OAuth queue mode. New requests use one active auth per group.
+  # When the active auth drops below threshold, new requests move to a healthy auth
+  # immediately; pinned/session-affinity requests may continue using the old auth
+  # for cache reuse until actual provider cooldown or manual disable.
   # codex-queue:
   #   enabled: false
   #   threshold-percent: 10

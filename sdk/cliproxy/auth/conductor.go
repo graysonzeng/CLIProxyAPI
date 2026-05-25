@@ -241,6 +241,17 @@ func (m *Manager) syncScheduler() {
 	m.syncSchedulerFromSnapshot(m.snapshotAuths())
 }
 
+func (m *Manager) reconcileCodexQueueNow(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	coordinator := m.CodexQueueCoordinator()
+	if coordinator == nil || !coordinator.Enabled() {
+		return
+	}
+	coordinator.ReconcileNow(ctx)
+}
+
 func (m *Manager) snapshotAuths() []*Auth {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1161,6 +1172,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
+	m.reconcileCodexQueueNow(ctx)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
 	return auth.Clone(), nil
@@ -1195,9 +1207,56 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
+	m.reconcileCodexQueueNow(ctx)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
+}
+
+// Remove deletes an auth entry from runtime routing state and, unless skipped
+// by context, from the backing store. File watcher delete events use
+// WithSkipPersist because the removed file is already the source of truth.
+func (m *Manager) Remove(ctx context.Context, id string) (*Auth, error) {
+	if m == nil {
+		return nil, nil
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, nil
+	}
+
+	var removed *Auth
+	m.mu.Lock()
+	if existing := m.auths[id]; existing != nil {
+		removed = existing.Clone()
+		delete(m.auths, id)
+	}
+	poolPrefix := strings.ToLower(id) + "|"
+	for key := range m.modelPoolOffsets {
+		if strings.HasPrefix(key, poolPrefix) {
+			delete(m.modelPoolOffsets, key)
+		}
+	}
+	for sessionID, sessionAuths := range m.homeRuntimeAuths {
+		delete(sessionAuths, id)
+		if len(sessionAuths) == 0 {
+			delete(m.homeRuntimeAuths, sessionID)
+		}
+	}
+	m.mu.Unlock()
+
+	if removed == nil {
+		return nil, nil
+	}
+	if m.scheduler != nil {
+		m.scheduler.removeAuth(id)
+	}
+	m.queueRefreshRemove(id)
+	m.reconcileCodexQueueNow(ctx)
+	if err := m.deletePersist(ctx, id); err != nil {
+		return removed, err
+	}
+	return removed, nil
 }
 
 // Load resets manager state from the backing store.
@@ -1227,6 +1286,7 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	m.mu.Unlock()
 	m.syncScheduler()
+	m.reconcileCodexQueueNow(ctx)
 	return nil
 }
 
@@ -2983,6 +3043,74 @@ func (m *Manager) pickPinnedSyntheticWarmup(providers []string, model string, op
 	return authCopy, executor, providerKey, nil, true
 }
 
+func (m *Manager) pickPinnedAuth(providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error, bool) {
+	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	if pinnedAuthID == "" {
+		return nil, nil, "", nil, false
+	}
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		providerKey := strings.ToLower(strings.TrimSpace(provider))
+		if providerKey != "" {
+			providerSet[providerKey] = struct{}{}
+		}
+	}
+	if len(providerSet) == 0 {
+		return nil, nil, "", &Error{Code: "provider_not_found", Message: "no provider supplied"}, true
+	}
+	if _, used := tried[pinnedAuthID]; used {
+		return nil, nil, "", &Error{Code: "auth_unavailable", Message: "no auth available"}, true
+	}
+
+	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
+	m.mu.RLock()
+	auth := m.auths[pinnedAuthID]
+	if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		m.mu.RUnlock()
+		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}, true
+	}
+	if disallowFreeAuth && isFreeCodexAuth(auth) {
+		m.mu.RUnlock()
+		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}, true
+	}
+	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if _, ok := providerSet[providerKey]; !ok {
+		m.mu.RUnlock()
+		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}, true
+	}
+	executor, okExecutor := m.executors[providerKey]
+	if !okExecutor {
+		m.mu.RUnlock()
+		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}, true
+	}
+	if model != "" && !m.authSupportsRouteModel(registry.GetGlobalRegistry(), auth, model) {
+		m.mu.RUnlock()
+		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}, true
+	}
+	if blocked, reason, next := isAuthBlockedForModelIgnoringQueue(auth, model, time.Now()); blocked {
+		m.mu.RUnlock()
+		if reason == blockReasonCooldown && !next.IsZero() {
+			resetIn := next.Sub(time.Now())
+			if resetIn < 0 {
+				resetIn = 0
+			}
+			return nil, nil, "", newModelCooldownError(model, providerKey, resetIn), true
+		}
+		return nil, nil, "", &Error{Code: "auth_unavailable", Message: "no auth available"}, true
+	}
+	authCopy := auth.Clone()
+	m.mu.RUnlock()
+	if !authCopy.indexAssigned {
+		m.mu.Lock()
+		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+			current.EnsureIndex()
+			authCopy = current.Clone()
+		}
+		m.mu.Unlock()
+	}
+	return authCopy, executor, providerKey, nil, true
+}
+
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
@@ -3063,6 +3191,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return auth, exec, err
 	}
 	if auth, exec, _, err, handled := m.pickPinnedSyntheticWarmup([]string{provider}, model, opts, tried); handled {
+		return auth, exec, err
+	}
+	if auth, exec, _, err, handled := m.pickPinnedAuth([]string{provider}, model, opts, tried); handled {
 		return auth, exec, err
 	}
 
@@ -3223,6 +3354,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
 	if auth, exec, providerKey, err, handled := m.pickPinnedSyntheticWarmup(providers, model, opts, tried); handled {
+		return auth, exec, providerKey, err
+	}
+	if auth, exec, providerKey, err, handled := m.pickPinnedAuth(providers, model, opts, tried); handled {
 		return auth, exec, providerKey, err
 	}
 
@@ -3781,6 +3915,13 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	return err
 }
 
+func (m *Manager) deletePersist(ctx context.Context, id string) error {
+	if m.store == nil || strings.TrimSpace(id) == "" || shouldSkipPersist(ctx) {
+		return nil
+	}
+	return m.store.Delete(ctx, id)
+}
+
 // StartAutoRefresh launches a background loop that evaluates auth freshness
 // every few seconds and triggers refresh operations when required.
 // Only one loop is kept alive; starting a new one cancels the previous run.
@@ -3842,6 +3983,19 @@ func (m *Manager) queueRefreshReschedule(authID string) {
 		return
 	}
 	loop.queueReschedule(authID)
+}
+
+func (m *Manager) queueRefreshRemove(authID string) {
+	if m == nil || authID == "" {
+		return
+	}
+	m.mu.RLock()
+	loop := m.refreshLoop
+	m.mu.RUnlock()
+	if loop == nil {
+		return
+	}
+	loop.remove(authID)
 }
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {

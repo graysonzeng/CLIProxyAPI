@@ -1,11 +1,14 @@
 package management
 
 import (
+	"bytes"
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -60,6 +63,101 @@ func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	}
 	if httpTransport.Proxy != nil {
 		t.Fatal("expected direct transport to disable proxy function")
+	}
+}
+
+func TestAPICallCodexUsageSynchronizesQueueQuotaSnapshot(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/wham/usage" {
+			t.Fatalf("path = %q, want /backend-api/wham/usage", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer old-token" {
+			t.Fatalf("authorization header = %q, want bearer token", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"rate_limit": {
+				"primary_window": {"used_percent": 95, "window_minutes": 300, "reset_at": 1893456000},
+				"secondary_window": {"used_percent": 20, "window_minutes": 10080, "reset_at": 1894060800}
+			},
+			"plan_type": "plus"
+		}`))
+	}))
+	defer upstream.Close()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "codex-auth-a",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "plus",
+		},
+		Metadata: map[string]any{
+			"access_token": "old-token",
+			"account_id":   "account-1",
+		},
+	}
+	registered, err := manager.Register(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-auth-b",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "plus",
+		},
+		Metadata: map[string]any{
+			"access_token": "standby-token",
+			"account_id":   "account-2",
+		},
+	}); err != nil {
+		t.Fatalf("register standby auth: %v", err)
+	}
+
+	coordinator := manager.EnsureCodexQueueCoordinator()
+	cfg := config.CodexQueueConfig{Enabled: true, ThresholdPercent: 10, IdleWindow: "1m"}
+	cfg.Normalize()
+	coordinator.ApplyConfig(cfg)
+	coordinator.SetProvider(coreauth.CodexQueueQuotaProviderFunc(func(ctx context.Context, auth *coreauth.Auth) (coreauth.CodexQuotaSnapshot, error) {
+		return coreauth.CodexQuotaSnapshot{
+			PrimaryWindow: coreauth.QuotaWindowSnapshot{PercentRemaining: 80, WindowMinutes: 300},
+			Status:        coreauth.CodexQuotaStatusKnown,
+		}, nil
+	}))
+	coordinator.Reconcile(context.Background())
+
+	h := &Handler{authManager: manager}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	body := `{"auth_index":"` + registered.Index + `","method":"GET","url":"` + upstream.URL + `/backend-api/wham/usage","header":{"Authorization":"Bearer $TOKEN$"}}`
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", bytes.NewBufferString(body))
+
+	h.APICall(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	state := coordinator.AuthState("codex-auth-a")
+	if state == nil {
+		t.Fatalf("queue state missing")
+	}
+	if got := state.Quota.PrimaryWindow.PercentRemaining; got != 5 {
+		t.Fatalf("primary percent remaining = %v, want 5", got)
+	}
+	if got := state.Quota.SecondaryWindow.PercentRemaining; got != 80 {
+		t.Fatalf("secondary percent remaining = %v, want 80", got)
+	}
+	groups := coordinator.Groups()
+	if len(groups) != 1 {
+		t.Fatalf("groups = %d, want 1", len(groups))
+	}
+	if got := groups[0].ActiveAuthID; got != "codex-auth-b" {
+		t.Fatalf("active auth = %q, want codex-auth-b", got)
 	}
 }
 

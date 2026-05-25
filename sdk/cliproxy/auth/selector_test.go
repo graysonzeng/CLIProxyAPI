@@ -700,6 +700,39 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 	}
 }
 
+func TestSessionAffinitySelector_CacheHitKeepsQueueBlockedAuth(t *testing.T) {
+	// Cannot run in parallel: this test mutates the package-level queue checker.
+	SetQueueRoutingBlockedChecker(func(authID string) bool {
+		return authID == "auth-a"
+	})
+	t.Cleanup(func() {
+		SetQueueRoutingBlockedChecker(nil)
+	})
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &FillFirstSelector{},
+		TTL:      time.Hour,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "auth-a", Provider: "codex"},
+		{ID: "auth-b", Provider: "codex"},
+	}
+	headers := http.Header{}
+	headers.Set("Session_id", "session-a")
+	opts := cliproxyexecutor.Options{Headers: headers}
+	selector.cache.Set("codex::codex:session-a::gpt-5.3-codex", "auth-a")
+
+	got, err := selector.Pick(context.Background(), "codex", "gpt-5.3-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "auth-a" {
+		t.Fatalf("Pick() = %v, want cached queue-blocked auth-a", got)
+	}
+}
+
 func TestRoundRobinSelectorPick_MixedVirtualAndNonVirtualFallsBackToFlat(t *testing.T) {
 	t.Parallel()
 

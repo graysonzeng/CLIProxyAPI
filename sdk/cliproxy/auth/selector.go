@@ -369,13 +369,21 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
+	return isAuthBlockedForModelWithQueue(auth, model, now, true)
+}
+
+func isAuthBlockedForModelIgnoringQueue(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
+	return isAuthBlockedForModelWithQueue(auth, model, now, false)
+}
+
+func isAuthBlockedForModelWithQueue(auth *Auth, model string, now time.Time, respectQueueRouting bool) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
-	if isQueueRoutingBlocked(auth.ID) {
+	if respectQueueRouting && isQueueRoutingBlocked(auth.ID) {
 		return true, blockReasonDisabled, time.Time{}
 	}
 	if model != "" {
@@ -493,19 +501,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
-	if err != nil {
-		return nil, err
-	}
-
 	cacheKey := provider + "::" + primaryID + "::" + model
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		for _, auth := range available {
-			if auth.ID == cachedAuthID {
-				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-				return auth, nil
-			}
+		if auth := findSessionCachedAuthIgnoringQueue(auths, cachedAuthID, model, now); auth != nil {
+			entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+			return auth, nil
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
 		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
@@ -520,12 +521,10 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey := provider + "::" + fallbackID + "::" + model
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
-			for _, auth := range available {
-				if auth.ID == cachedAuthID {
-					s.cache.Set(cacheKey, auth.ID)
-					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
-					return auth, nil
-				}
+			if auth := findSessionCachedAuthIgnoringQueue(auths, cachedAuthID, model, now); auth != nil {
+				s.cache.Set(cacheKey, auth.ID)
+				entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+				return auth, nil
 			}
 		}
 	}
@@ -537,6 +536,24 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	s.cache.Set(cacheKey, auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+func findSessionCachedAuthIgnoringQueue(auths []*Auth, authID, model string, now time.Time) *Auth {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return nil
+	}
+	for _, auth := range auths {
+		if auth == nil || auth.ID != authID {
+			continue
+		}
+		blocked, _, _ := isAuthBlockedForModelIgnoringQueue(auth, model, now)
+		if blocked {
+			return nil
+		}
+		return auth
+	}
+	return nil
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {

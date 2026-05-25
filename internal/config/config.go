@@ -247,9 +247,10 @@ type RoutingConfig struct {
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
 
 	// CodexQueue configures the opt-in Codex OAuth queue mode that draws one
-	// Codex auth at a time within an equivalent group, switching when any known
-	// quota window is below threshold and the active auth has been idle for the
-	// configured window. See docs/superpowers/specs/2026-05-14-codex-oauth-queue-mode-design.md.
+	// Codex auth at a time within an equivalent group. When any known quota
+	// window drops below threshold, new requests switch to a healthy candidate
+	// immediately while pinned/session-affinity requests may keep using the
+	// previous auth for cache reuse. See docs/superpowers/specs/2026-05-14-codex-oauth-queue-mode-design.md.
 	CodexQueue CodexQueueConfig `yaml:"codex-queue,omitempty" json:"codex-queue,omitempty"`
 }
 
@@ -269,8 +270,9 @@ type CodexQueueConfig struct {
 	ThresholdPercent float64 `yaml:"threshold-percent,omitempty" json:"threshold-percent,omitempty"`
 
 	// IdleWindow is the sliding "no new real requests" window required before
-	// the coordinator may switch off the active auth once it is switch-pending.
-	// Accepts Go duration strings (e.g. "10m", "5m30s"). Default: 10m.
+	// a drained low-quota auth is marked queue-managed disabled after new
+	// requests have already moved to a healthy candidate. Accepts Go duration
+	// strings (e.g. "10m", "5m30s"). Default: 10m.
 	IdleWindow string `yaml:"idle-window,omitempty" json:"idle-window,omitempty"`
 
 	// RecoveryDwell is the minimum dwell after automatic queue recovery before

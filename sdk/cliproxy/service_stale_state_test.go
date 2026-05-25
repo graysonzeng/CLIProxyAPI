@@ -40,37 +40,8 @@ func TestServiceApplyCoreAuthAddOrUpdate_DeleteReAddDoesNotInheritStaleRuntimeSt
 
 	service.applyCoreAuthRemoval(context.Background(), authID)
 
-	disabled, ok := service.coreManager.GetByID(authID)
-	if !ok || disabled == nil {
-		t.Fatalf("expected disabled auth after removal")
-	}
-	if !disabled.Disabled || disabled.Status != coreauth.StatusDisabled {
-		t.Fatalf("expected disabled auth after removal, got disabled=%v status=%v", disabled.Disabled, disabled.Status)
-	}
-	if disabled.LastRefreshedAt.IsZero() {
-		t.Fatalf("expected disabled auth to still carry prior LastRefreshedAt for regression setup")
-	}
-	if disabled.NextRefreshAfter.IsZero() {
-		t.Fatalf("expected disabled auth to still carry prior NextRefreshAfter for regression setup")
-	}
-
-	// Reconcile prunes unsupported model state during registration, so seed the
-	// disabled snapshot explicitly before exercising delete -> re-add behavior.
-	disabled.ModelStates = map[string]*coreauth.ModelState{
-		modelID: {
-			Quota: coreauth.QuotaState{BackoffLevel: 7},
-		},
-	}
-	if _, err := service.coreManager.Update(context.Background(), disabled); err != nil {
-		t.Fatalf("seed disabled auth stale ModelStates: %v", err)
-	}
-
-	disabled, ok = service.coreManager.GetByID(authID)
-	if !ok || disabled == nil {
-		t.Fatalf("expected disabled auth after stale state seeding")
-	}
-	if len(disabled.ModelStates) == 0 {
-		t.Fatalf("expected disabled auth to carry seeded ModelStates for regression setup")
+	if removed, ok := service.coreManager.GetByID(authID); ok || removed != nil {
+		t.Fatalf("expected removed auth to be absent, got %+v", removed)
 	}
 
 	service.applyCoreAuthAddOrUpdate(context.Background(), &coreauth.Auth{
@@ -97,6 +68,65 @@ func TestServiceApplyCoreAuthAddOrUpdate_DeleteReAddDoesNotInheritStaleRuntimeSt
 	}
 	if models := registry.GetGlobalRegistry().GetModelsForClient(authID); len(models) == 0 {
 		t.Fatalf("expected re-added auth to re-register models in global registry")
+	}
+}
+
+func TestServiceApplyCoreAuthRemovalPrunesCodexQueueMember(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: manager,
+	}
+	coordinator := manager.EnsureCodexQueueCoordinator()
+	t.Cleanup(func() {
+		coordinator.Stop()
+		coreauth.SetQueueManagedDisabledChecker(nil)
+		coreauth.SetQueueRoutingBlockedChecker(nil)
+		coreauth.SetQueueRealRequestRecorder(nil)
+	})
+
+	for _, id := range []string{"codex-auth-1", "codex-auth-2"} {
+		if _, err := manager.Register(context.Background(), &coreauth.Auth{
+			ID:         id,
+			Provider:   "codex",
+			Status:     coreauth.StatusActive,
+			Attributes: map[string]string{"plan_type": "plus"},
+		}); err != nil {
+			t.Fatalf("register %s: %v", id, err)
+		}
+	}
+	queueCfg := config.CodexQueueConfig{
+		Enabled:          true,
+		ThresholdPercent: 10,
+		IdleWindow:       "1m",
+	}
+	queueCfg.Normalize()
+	coordinator.ApplyConfig(queueCfg)
+	coordinator.SetProvider(coreauth.CodexQueueQuotaProviderFunc(func(ctx context.Context, auth *coreauth.Auth) (coreauth.CodexQuotaSnapshot, error) {
+		return coreauth.CodexQuotaSnapshot{
+			PrimaryWindow: coreauth.QuotaWindowSnapshot{PercentRemaining: 80, WindowMinutes: 300},
+			Status:        coreauth.CodexQuotaStatusKnown,
+		}, nil
+	}))
+	coordinator.Reconcile(context.Background())
+
+	service.applyCoreAuthRemoval(context.Background(), "codex-auth-1")
+
+	if removed, ok := manager.GetByID("codex-auth-1"); ok || removed != nil {
+		t.Fatalf("removed auth still present in manager: %+v", removed)
+	}
+	if state := coordinator.AuthState("codex-auth-1"); state != nil {
+		t.Fatalf("removed auth still present in queue state: %+v", state)
+	}
+	groups := coordinator.Groups()
+	if len(groups) != 1 {
+		t.Fatalf("queue groups = %d, want 1", len(groups))
+	}
+	if got := len(groups[0].Members); got != 1 {
+		t.Fatalf("queue member count after removal = %d, want 1", got)
+	}
+	if groups[0].Members[0].AuthID != "codex-auth-2" {
+		t.Fatalf("remaining queue member = %q, want codex-auth-2", groups[0].Members[0].AuthID)
 	}
 }
 
