@@ -160,13 +160,31 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	// For codex auth files, extract plan_type from the JWT id_token.
+	// Fall back to the file-level plan_type or chatgpt_plan_type when the
+	// id_token claim is missing or stale (e.g. token issued before an upgrade).
 	if provider == "codex" {
+		jwtPlan := ""
 		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
 			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
-				if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
-					a.Attributes["plan_type"] = pt
-				}
+				jwtPlan = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
 			}
+		}
+		filePlan := ""
+		if v, ok := metadata["plan_type"].(string); ok {
+			filePlan = strings.TrimSpace(v)
+		}
+		if filePlan == "" {
+			if v, ok := metadata["chatgpt_plan_type"].(string); ok {
+				filePlan = strings.TrimSpace(v)
+			}
+		}
+		plan := jwtPlan
+		if filePlan != "" && !strings.EqualFold(filePlan, "free") &&
+			(plan == "" || strings.EqualFold(plan, "free")) {
+			plan = filePlan
+		}
+		if plan != "" {
+			a.Attributes["plan_type"] = plan
 		}
 	}
 	if provider == "gemini-cli" {

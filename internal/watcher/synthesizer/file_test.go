@@ -955,3 +955,79 @@ func TestFileSynthesizer_Synthesize_MultiProjectGeminiWithNote(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexPlanTypeFallbackToFileMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]any
+		wantPlan string
+	}{
+		{
+			name: "file plan_type overrides jwt free",
+			metadata: map[string]any{
+				"type":              "codex",
+				"email":             "test@example.com",
+				"id_token":          "", // no JWT
+				"plan_type":         "plus",
+				"chatgpt_plan_type": "plus",
+			},
+			wantPlan: "plus",
+		},
+		{
+			name: "chatgpt_plan_type fallback when plan_type missing",
+			metadata: map[string]any{
+				"type":              "codex",
+				"email":             "test@example.com",
+				"chatgpt_plan_type": "pro",
+			},
+			wantPlan: "pro",
+		},
+		{
+			name: "file free does not override jwt free",
+			metadata: map[string]any{
+				"type":      "codex",
+				"email":     "test@example.com",
+				"plan_type": "free",
+			},
+			wantPlan: "",
+		},
+		{
+			name: "no plan info yields empty",
+			metadata: map[string]any{
+				"type":  "codex",
+				"email": "test@example.com",
+			},
+			wantPlan: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			data, _ := json.Marshal(tt.metadata)
+			if err := os.WriteFile(filepath.Join(tempDir, "codex-test.json"), data, 0644); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			synth := NewFileSynthesizer()
+			ctx := &SynthesisContext{
+				Config:      &config.Config{},
+				AuthDir:     tempDir,
+				Now:         time.Date(2026, 5, 28, 0, 0, 0, 0, time.UTC),
+				IDGenerator: NewStableIDGenerator(),
+			}
+
+			auths, err := synth.Synthesize(ctx)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(auths) != 1 {
+				t.Fatalf("expected 1 auth, got %d", len(auths))
+			}
+			got := auths[0].Attributes["plan_type"]
+			if got != tt.wantPlan {
+				t.Errorf("plan_type = %q, want %q", got, tt.wantPlan)
+			}
+		})
+	}
+}
