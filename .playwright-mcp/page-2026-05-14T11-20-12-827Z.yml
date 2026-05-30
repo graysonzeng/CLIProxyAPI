@@ -1,0 +1,517 @@
+- generic [ref=e1]:
+  - generic [ref=e54]:
+    - banner:
+      - button "收起" [ref=e55] [cursor=pointer]:
+        - img [ref=e56]
+      - generic [ref=e58]:
+        - button "刷新全部" [ref=e59] [cursor=pointer]:
+          - img [ref=e61]
+        - button "语言" [ref=e65] [cursor=pointer]:
+          - img [ref=e67]
+        - button "主题" [ref=e71] [cursor=pointer]:
+          - img [ref=e73]
+        - button "登出" [ref=e80] [cursor=pointer]:
+          - img [ref=e82]
+    - generic [ref=e85]:
+      - complementary [ref=e86]:
+        - generic "CLI Proxy API Management Center" [ref=e87]:
+          - img "CPAMC logo" [ref=e88]
+          - generic [ref=e89]: CPAMC
+        - generic [ref=e90]:
+          - link "仪表盘" [ref=e91] [cursor=pointer]:
+            - /url: "#/"
+            - img [ref=e93]
+            - generic [ref=e98]: 仪表盘
+          - link "配置面板" [ref=e99] [cursor=pointer]:
+            - /url: "#/config"
+            - img [ref=e101]
+            - generic [ref=e104]: 配置面板
+          - link "AI 提供商" [ref=e105] [cursor=pointer]:
+            - /url: "#/ai-providers"
+            - img [ref=e107]
+            - generic [ref=e113]: AI 提供商
+          - link "认证文件" [active] [ref=e114] [cursor=pointer]:
+            - /url: "#/auth-files"
+            - img [ref=e116]
+            - generic [ref=e120]: 认证文件
+          - link "OAuth 登录" [ref=e121] [cursor=pointer]:
+            - /url: "#/oauth"
+            - img [ref=e123]
+            - generic [ref=e126]: OAuth 登录
+          - link "配额管理" [ref=e127] [cursor=pointer]:
+            - /url: "#/quota"
+            - img [ref=e129]
+            - generic [ref=e132]: 配额管理
+          - link "中心信息" [ref=e133] [cursor=pointer]:
+            - /url: "#/system"
+            - img [ref=e135]
+            - generic [ref=e138]: 中心信息
+      - main [ref=e140]:
+        - generic [ref=e141]:
+          - generic:
+            - generic:
+              - generic:
+                - heading [level=1]: 认证文件管理
+                - paragraph: 这里集中管理 CLI Proxy 支持的所有 JSON 认证文件（如 Qwen、Gemini、Vertex 等），上传后即可在运行时启用相应的 AI 服务。
+              - generic:
+                - generic:
+                  - generic:
+                    - generic:
+                      - generic: 认证文件
+                  - generic:
+                    - button:
+                      - generic: 刷新
+                    - button:
+                      - generic: 上传文件
+                    - button:
+                      - generic: 删除全部
+                - generic:
+                  - generic:
+                    - generic:
+                      - button:
+                        - generic:
+                          - generic:
+                            - img
+                          - generic: 全部
+                        - generic: "0"
+                  - generic:
+                    - generic:
+                      - generic:
+                        - generic:
+                          - generic: 搜索配置文件
+                          - generic:
+                            - generic:
+                              - textbox:
+                                - /placeholder: 输入名称、类型或提供方关键字，支持 * 通配
+                        - generic:
+                          - generic: 单页数量
+                          - spinbutton: "9"
+                        - generic:
+                          - generic: 排序
+                          - generic:
+                            - button:
+                              - generic: 默认
+                              - generic:
+                                - img
+                        - generic:
+                          - generic: 显示选项
+                          - generic:
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic: 仅显示有问题凭证
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic: 仅显示已停用凭证
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic: 简略模式
+                    - generic:
+                      - generic:
+                        - generic:
+                          - img
+                        - generic:
+                          - generic: 没有匹配的配置文件
+                          - generic: 请调整筛选条件或清空搜索关键字再试一次。
+              - generic:
+                - generic:
+                  - generic: OAuth 模型禁用
+                  - button:
+                    - generic: 新增禁用
+                - generic:
+                  - generic:
+                    - generic:
+                      - generic: oauth-excluded-models
+                      - generic: 未配置禁用模型
+                    - generic:
+                      - button:
+                        - generic: 编辑
+                      - button:
+                        - generic: 删除提供商
+              - generic:
+                - generic:
+                  - generic: OAuth 模型别名
+                  - generic:
+                    - generic:
+                      - button:
+                        - generic: 管理
+                      - button:
+                        - generic: 概览
+                    - button:
+                      - generic: 新增别名
+                - generic:
+                  - generic:
+                    - generic:
+                      - img
+                    - generic:
+                      - generic: 暂无任何提供商的模型别名，点击“新增别名”创建。
+          - generic [ref=e288]:
+            - generic [ref=e289]:
+              - generic [ref=e290]:
+                - generic [ref=e291]: 可视化编辑
+                - heading "配置面板" [level=1] [ref=e292]
+                - paragraph [ref=e293]: 可视化模式覆盖常用字段，未覆盖的配置仍需在源文件模式中查看或编辑。
+              - generic [ref=e294]:
+                - generic [ref=e295]: 加载配置中...
+                - generic [ref=e296]:
+                  - button "可视化编辑" [disabled] [ref=e297]
+                  - button "源文件编辑" [disabled] [ref=e298]
+            - generic [ref=e301]:
+              - generic [ref=e302]:
+                - generic [ref=e305]: 快速跳转
+                - generic [ref=e306]:
+                  - button "服务器配置 基础服务器设置" [ref=e307] [cursor=pointer]:
+                    - img [ref=e309]
+                    - generic [ref=e312]:
+                      - generic [ref=e313]: 服务器配置
+                      - generic [ref=e314]: 基础服务器设置
+                  - button "网络配置 代理、重试和路由设置" [ref=e315] [cursor=pointer]:
+                    - img [ref=e317]
+                    - generic [ref=e320]:
+                      - generic [ref=e321]: 网络配置
+                      - generic [ref=e322]: 代理、重试和路由设置
+                  - button "Payload 配置 默认值、原始 JSON 规则、覆盖规则与过滤规则" [ref=e323] [cursor=pointer]:
+                    - img [ref=e325]
+                    - generic [ref=e328]:
+                      - generic [ref=e329]: Payload 配置
+                      - generic [ref=e330]: 默认值、原始 JSON 规则、覆盖规则与过滤规则
+              - generic [ref=e331]:
+                - complementary [ref=e332]
+                - generic [ref=e334]:
+                  - generic [ref=e335]:
+                    - generic [ref=e336]:
+                      - generic [ref=e337]:
+                        - generic [ref=e338]: "01"
+                        - img [ref=e340]
+                      - generic [ref=e343]:
+                        - heading "服务器配置" [level=2] [ref=e344]
+                        - paragraph [ref=e345]: 基础服务器设置
+                    - generic [ref=e347]:
+                      - generic [ref=e348]:
+                        - generic [ref=e349]: 主机地址
+                        - textbox "主机地址" [disabled] [ref=e351]:
+                          - /placeholder: 0.0.0.0
+                      - generic [ref=e352]:
+                        - generic [ref=e353]: 端口
+                        - spinbutton "端口" [disabled] [ref=e355]
+                  - generic [ref=e356]:
+                    - generic [ref=e357]:
+                      - generic [ref=e358]:
+                        - generic [ref=e359]: "02"
+                        - img [ref=e361]
+                      - generic [ref=e363]:
+                        - heading "TLS/SSL 配置" [level=2] [ref=e364]
+                        - paragraph [ref=e365]: HTTPS 安全连接设置
+                    - generic [ref=e368]:
+                      - generic [ref=e369]:
+                        - generic [ref=e370]: 启用 TLS
+                        - generic [ref=e371]: 启用 HTTPS 安全连接
+                      - generic [ref=e372]:
+                        - checkbox "启用 TLS" [disabled]
+                  - generic [ref=e375]:
+                    - generic [ref=e376]:
+                      - generic [ref=e377]:
+                        - generic [ref=e378]: "03"
+                        - img [ref=e380]
+                      - generic [ref=e386]:
+                        - heading "远程管理" [level=2] [ref=e387]
+                        - paragraph [ref=e388]: 远程访问和控制面板设置
+                    - generic [ref=e390]:
+                      - generic [ref=e391]:
+                        - generic [ref=e392]:
+                          - generic [ref=e393]: 允许远程访问
+                          - generic [ref=e394]: 允许从其他主机访问管理接口
+                        - generic [ref=e395]:
+                          - checkbox "允许远程访问" [disabled]
+                      - generic [ref=e398]:
+                        - generic [ref=e399]:
+                          - generic [ref=e400]: 禁用控制面板
+                          - generic [ref=e401]: 禁用内置的 Web 控制面板
+                        - generic [ref=e402]:
+                          - checkbox "禁用控制面板" [disabled]
+                      - generic [ref=e405]:
+                        - generic [ref=e406]:
+                          - generic [ref=e407]: 管理密钥
+                          - textbox "管理密钥" [disabled] [ref=e409]:
+                            - /placeholder: 设置管理密钥
+                        - generic [ref=e410]:
+                          - generic [ref=e411]: 面板仓库
+                          - textbox "面板仓库" [disabled] [ref=e413]:
+                            - /placeholder: https://github.com/router-for-me/Cli-Proxy-API-Management-Center
+                  - generic [ref=e414]:
+                    - generic [ref=e415]:
+                      - generic [ref=e416]:
+                        - generic [ref=e417]: "04"
+                        - img [ref=e419]
+                      - generic [ref=e423]:
+                        - heading "认证配置" [level=2] [ref=e424]
+                        - paragraph [ref=e425]: API 密钥与认证文件目录设置
+                    - generic [ref=e427]:
+                      - generic [ref=e428]:
+                        - generic [ref=e429]: 认证文件目录 (auth-dir)
+                        - textbox "认证文件目录 (auth-dir)" [disabled] [ref=e431]:
+                          - /placeholder: ~/.cli-proxy-api
+                        - generic [ref=e432]: 存放认证文件的目录路径（支持 ~）
+                      - generic [ref=e434]:
+                        - generic [ref=e435]:
+                          - generic [ref=e436]: API 密钥列表 (api-keys)
+                          - button "添加 API 密钥" [disabled] [ref=e437]:
+                            - generic [ref=e438]: 添加 API 密钥
+                        - generic [ref=e439]: 暂无 API 密钥
+                        - generic [ref=e440]: 每个条目代表一个 API 密钥（与 「API 密钥管理」 页面样式一致）
+                  - generic [ref=e441]:
+                    - generic [ref=e442]:
+                      - generic [ref=e443]:
+                        - generic [ref=e444]: "05"
+                        - img [ref=e446]
+                      - generic [ref=e448]:
+                        - heading "系统配置" [level=2] [ref=e449]
+                        - paragraph [ref=e450]: 调试、日志、统计与性能调试设置
+                    - generic [ref=e452]:
+                      - generic [ref=e453]:
+                        - generic [ref=e454]:
+                          - generic [ref=e455]:
+                            - generic [ref=e456]: 调试模式
+                            - generic [ref=e457]: 启用详细的调试日志
+                          - generic [ref=e458]:
+                            - checkbox "调试模式" [disabled]
+                        - generic [ref=e461]:
+                          - generic [ref=e462]:
+                            - generic [ref=e463]: 商业模式
+                            - generic [ref=e464]: 禁用高开销中间件以支持高并发
+                          - generic [ref=e465]:
+                            - checkbox "商业模式" [disabled]
+                        - generic [ref=e468]:
+                          - generic [ref=e469]:
+                            - generic [ref=e470]: 写入日志文件
+                            - generic [ref=e471]: 将日志保存到文件
+                          - generic [ref=e472]:
+                            - checkbox "写入日志文件" [disabled]
+                      - generic [ref=e476]:
+                        - generic [ref=e477]: 日志文件大小限制 (MB)
+                        - spinbutton "日志文件大小限制 (MB)" [disabled] [ref=e479]
+                  - generic [ref=e480]:
+                    - generic [ref=e481]:
+                      - generic [ref=e482]:
+                        - generic [ref=e483]: "06"
+                        - img [ref=e485]
+                      - generic [ref=e488]:
+                        - heading "网络配置" [level=2] [ref=e489]
+                        - paragraph [ref=e490]: 代理、重试和路由设置
+                    - generic [ref=e492]:
+                      - generic [ref=e493]:
+                        - generic [ref=e494]:
+                          - generic [ref=e495]: 代理 URL
+                          - textbox "代理 URL" [disabled] [ref=e497]:
+                            - /placeholder: socks5://user:pass@127.0.0.1:1080/
+                        - generic [ref=e498]:
+                          - generic [ref=e499]: 请求重试次数
+                          - spinbutton "请求重试次数" [disabled] [ref=e501]
+                        - generic [ref=e502]:
+                          - generic [ref=e503]: 最大重试凭据数
+                          - spinbutton "最大重试凭据数" [disabled] [ref=e505]
+                          - generic [ref=e506]: 留空表示不设置；设为 0 表示保留 legacy 行为，并尝试所有可用凭据。
+                        - generic [ref=e507]:
+                          - generic [ref=e508]: 最大重试间隔 (秒)
+                          - spinbutton "最大重试间隔 (秒)" [disabled] [ref=e510]
+                        - generic [ref=e511]:
+                          - generic [ref=e512]: 路由策略
+                          - button "路由策略" [disabled] [ref=e514] [cursor=pointer]:
+                            - generic [ref=e515]: 轮询 (Round Robin)
+                            - img [ref=e517]
+                          - generic [ref=e519]: 选择凭据选择策略
+                        - generic [ref=e520]:
+                          - generic [ref=e521]: 会话粘性 TTL
+                          - textbox "会话粘性 TTL" [disabled] [ref=e523]:
+                            - /placeholder: 1h
+                      - generic [ref=e524]:
+                        - generic [ref=e525]:
+                          - generic [ref=e526]:
+                            - generic [ref=e527]: 强制模型前缀
+                            - generic [ref=e528]: 未带前缀的模型请求只使用无前缀凭据
+                          - generic [ref=e529]:
+                            - checkbox "强制模型前缀" [disabled]
+                        - generic [ref=e532]:
+                          - generic [ref=e534]: 会话粘性路由
+                          - generic [ref=e535]:
+                            - checkbox "会话粘性路由" [disabled]
+                        - generic [ref=e538]:
+                          - generic [ref=e539]:
+                            - generic [ref=e540]: WebSocket 认证
+                            - generic [ref=e541]: 启用 WebSocket 连接认证 (/v1/ws)
+                          - generic [ref=e542]:
+                            - checkbox "WebSocket 认证" [disabled]
+                  - generic [ref=e545]:
+                    - generic [ref=e546]:
+                      - generic [ref=e547]:
+                        - generic [ref=e548]: "07"
+                        - img [ref=e550]
+                      - generic [ref=e553]:
+                        - heading "配额回退" [level=2] [ref=e554]
+                        - paragraph [ref=e555]: 配额耗尽时的回退策略
+                    - generic [ref=e557]:
+                      - generic [ref=e558]:
+                        - generic [ref=e559]:
+                          - generic [ref=e560]: 切换项目
+                          - generic [ref=e561]: 配额耗尽时自动切换到其他项目
+                        - generic [ref=e562]:
+                          - checkbox "切换项目" [checked] [disabled]
+                      - generic [ref=e565]:
+                        - generic [ref=e566]:
+                          - generic [ref=e567]: 切换预览模型
+                          - generic [ref=e568]: 配额耗尽时切换到预览版本模型
+                        - generic [ref=e569]:
+                          - checkbox "切换预览模型" [checked] [disabled]
+                      - generic [ref=e572]:
+                        - generic [ref=e573]:
+                          - generic [ref=e574]: Antigravity Credits 重试
+                          - generic [ref=e575]: Antigravity 返回 quota_exhausted 429 时，使用 enabledCreditTypes=["GOOGLE_ONE_AI"] 重试一次
+                        - generic [ref=e576]:
+                          - checkbox "Antigravity Credits 重试" [disabled]
+                  - generic [ref=e579]:
+                    - generic [ref=e580]:
+                      - generic [ref=e581]:
+                        - generic [ref=e582]: "08"
+                        - img [ref=e584]
+                      - generic [ref=e590]:
+                        - heading "流式传输配置" [level=2] [ref=e591]
+                        - paragraph [ref=e592]: Keepalive 与 bootstrap 重试设置
+                    - generic [ref=e594]:
+                      - generic [ref=e595]:
+                        - generic [ref=e596]:
+                          - generic [ref=e597]: Keepalive 秒数
+                          - generic [ref=e598]:
+                            - spinbutton "Keepalive 秒数" [disabled] [ref=e599]
+                            - generic [ref=e600]: 已禁用
+                          - generic [ref=e601]: 设置为 0 或留空表示禁用 keepalive
+                        - generic [ref=e602]:
+                          - generic [ref=e603]: Bootstrap 重试次数
+                          - spinbutton "Bootstrap 重试次数" [disabled] [ref=e605]
+                          - generic [ref=e606]: 流式传输启动时（首包前）的重试次数
+                      - generic [ref=e608]:
+                        - generic [ref=e609]: 非流式 Keepalive 间隔 (秒)
+                        - generic [ref=e610]:
+                          - spinbutton "非流式 Keepalive 间隔 (秒)" [disabled] [ref=e611]
+                          - generic [ref=e612]: 已禁用
+                        - generic [ref=e613]: 非流式响应时每隔 N 秒发送空行以防止空闲超时，设置为 0 或留空表示禁用
+                  - generic [ref=e614]:
+                    - generic [ref=e615]:
+                      - generic [ref=e616]:
+                        - generic [ref=e617]: "09"
+                        - img [ref=e619]
+                      - generic [ref=e622]:
+                        - heading "Payload 配置" [level=2] [ref=e623]
+                        - paragraph [ref=e624]: 默认值、原始 JSON 规则、覆盖规则与过滤规则
+                    - generic [ref=e626]:
+                      - generic [ref=e627]:
+                        - generic [ref=e628]:
+                          - heading "默认规则" [level=3] [ref=e629]
+                          - paragraph [ref=e630]: 当请求中未指定参数时，使用这些默认值
+                        - generic [ref=e631]:
+                          - generic [ref=e632]: 暂无规则
+                          - button "添加规则" [disabled] [ref=e634]:
+                            - generic [ref=e635]: 添加规则
+                      - generic [ref=e636]:
+                        - generic [ref=e637]:
+                          - heading "默认 Raw 规则" [level=3] [ref=e638]
+                          - paragraph [ref=e639]: "当请求中未指定参数时，按原始 JSON 片段写入这些值，例如 true、123、\"high\" 或 {\"type\":\"object\"}"
+                        - generic [ref=e640]:
+                          - generic [ref=e641]: 暂无规则
+                          - button "添加规则" [disabled] [ref=e643]:
+                            - generic [ref=e644]: 添加规则
+                      - generic [ref=e645]:
+                        - generic [ref=e646]:
+                          - heading "覆盖规则" [level=3] [ref=e647]
+                          - paragraph [ref=e648]: 强制覆盖请求中的参数值
+                        - generic [ref=e649]:
+                          - generic [ref=e650]: 暂无规则
+                          - button "添加规则" [disabled] [ref=e652]:
+                            - generic [ref=e653]: 添加规则
+                      - generic [ref=e654]:
+                        - generic [ref=e655]:
+                          - heading "覆盖 Raw 规则" [level=3] [ref=e656]
+                          - paragraph [ref=e657]: 始终按原始 JSON 片段覆盖参数值，适合 response_format、schema 等复杂字段
+                        - generic [ref=e658]:
+                          - generic [ref=e659]: 暂无规则
+                          - button "添加规则" [disabled] [ref=e661]:
+                            - generic [ref=e662]: 添加规则
+                      - generic [ref=e663]:
+                        - generic [ref=e664]:
+                          - heading "过滤规则" [level=3] [ref=e665]
+                          - paragraph [ref=e666]: 通过 JSON Path 预过滤上游请求体，自动剔除不合规/冗余参数（Request Sanitization）
+                        - generic [ref=e667]:
+                          - generic [ref=e668]: 暂无规则
+                          - button "添加规则" [disabled] [ref=e670]:
+                            - generic [ref=e671]: 添加规则
+  - generic [ref=e674]:
+    - button "01 服务器配置 基础服务器设置" [ref=e675] [cursor=pointer]:
+      - generic [ref=e676]: "01"
+      - generic [ref=e677]:
+        - generic [ref=e679]:
+          - img [ref=e681]
+          - generic [ref=e684]: 服务器配置
+        - generic [ref=e685]: 基础服务器设置
+    - button "02 TLS/SSL 配置 HTTPS 安全连接设置" [ref=e686] [cursor=pointer]:
+      - generic [ref=e687]: "02"
+      - generic [ref=e688]:
+        - generic [ref=e690]:
+          - img [ref=e692]
+          - generic [ref=e694]: TLS/SSL 配置
+        - generic [ref=e695]: HTTPS 安全连接设置
+    - button "03 远程管理 远程访问和控制面板设置" [ref=e696] [cursor=pointer]:
+      - generic [ref=e697]: "03"
+      - generic [ref=e698]:
+        - generic [ref=e700]:
+          - img [ref=e702]
+          - generic [ref=e708]: 远程管理
+        - generic [ref=e709]: 远程访问和控制面板设置
+    - button "04 认证配置 API 密钥与认证文件目录设置" [ref=e710] [cursor=pointer]:
+      - generic [ref=e711]: "04"
+      - generic [ref=e712]:
+        - generic [ref=e714]:
+          - img [ref=e716]
+          - generic [ref=e720]: 认证配置
+        - generic [ref=e721]: API 密钥与认证文件目录设置
+    - button "05 系统配置 调试、日志、统计与性能调试设置" [ref=e722] [cursor=pointer]:
+      - generic [ref=e723]: "05"
+      - generic [ref=e724]:
+        - generic [ref=e726]:
+          - img [ref=e728]
+          - generic [ref=e730]: 系统配置
+        - generic [ref=e731]: 调试、日志、统计与性能调试设置
+    - button "06 网络配置 代理、重试和路由设置" [ref=e732] [cursor=pointer]:
+      - generic [ref=e733]: "06"
+      - generic [ref=e734]:
+        - generic [ref=e736]:
+          - img [ref=e738]
+          - generic [ref=e741]: 网络配置
+        - generic [ref=e742]: 代理、重试和路由设置
+    - button "07 配额回退 配额耗尽时的回退策略" [ref=e743] [cursor=pointer]:
+      - generic [ref=e744]: "07"
+      - generic [ref=e745]:
+        - generic [ref=e747]:
+          - img [ref=e749]
+          - generic [ref=e752]: 配额回退
+        - generic [ref=e753]: 配额耗尽时的回退策略
+    - button "08 流式传输配置 Keepalive 与 bootstrap 重试设置" [ref=e754] [cursor=pointer]:
+      - generic [ref=e755]: "08"
+      - generic [ref=e756]:
+        - generic [ref=e758]:
+          - img [ref=e760]
+          - generic [ref=e766]: 流式传输配置
+        - generic [ref=e767]: Keepalive 与 bootstrap 重试设置
+    - button "09 Payload 配置 默认值、原始 JSON 规则、覆盖规则与过滤规则" [ref=e768] [cursor=pointer]:
+      - generic [ref=e769]: "09"
+      - generic [ref=e770]:
+        - generic [ref=e772]:
+          - img [ref=e774]
+          - generic [ref=e777]: Payload 配置
+        - generic [ref=e778]: 默认值、原始 JSON 规则、覆盖规则与过滤规则
+  - generic [ref=e780]:
+    - generic [ref=e781]: 加载配置中...
+    - button "重新加载" [disabled] [ref=e782]:
+      - img [ref=e783]
+    - button "保存" [disabled] [ref=e786]:
+      - img [ref=e787]
