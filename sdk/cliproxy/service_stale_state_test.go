@@ -40,8 +40,8 @@ func TestServiceApplyCoreAuthAddOrUpdate_DeleteReAddDoesNotInheritStaleRuntimeSt
 
 	service.applyCoreAuthRemoval(context.Background(), authID)
 
-	if removed, ok := service.coreManager.GetByID(authID); ok || removed != nil {
-		t.Fatalf("expected removed auth to be absent, got %+v", removed)
+	if _, ok := service.coreManager.GetByID(authID); ok {
+		t.Fatalf("expected auth %q to be removed from runtime state", authID)
 	}
 
 	service.applyCoreAuthAddOrUpdate(context.Background(), &coreauth.Auth{
