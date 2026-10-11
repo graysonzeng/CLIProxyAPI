@@ -22,4 +22,4 @@ cd $M; git fetch -q origin; git checkout -q --detach origin/main; git clean -fdq
 cd $R
 MGMT_ROOT=$M SSH_HOST=ompcli ./scripts/deploy-ompcli-3repo.sh || { log "deploy API/UI failed (auto-rollback attempted)"; exit 5; }
 ./scripts/deploy-cpamp-ompcli.sh || { log "CPAMP upgrade failed (rolled back)"; exit 6; }
-$W/verify.sh | tee -a $LOG
+$W/verify.sh | tee -a $LOG; [[ ${PIPESTATUS[0]} == 0 ]] || { log "MANDATORY chat verification failed -> auto-rollback API binary + UI"; ssh ompcli 'B=$(ls -t /root/cliproxyapi/cli-proxy-api.backup.*[0-9a-f] | head -1); H=$(ls -t /root/cliproxyapi/static/management.html.backup.*[0-9a-f] | head -1); cp -a $B /root/cliproxyapi/cli-proxy-api && cp -a $H /root/cliproxyapi/static/management.html && systemctl restart cliproxyapi.service && echo restored $B $H' | tee -a $LOG; exit 7; }
