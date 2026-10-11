@@ -120,7 +120,7 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
       -ldflags "-s -w -X main.Version=${VERSION}-dirty -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
       -o "${LOCAL_BIN}" \
       ./cmd/server
-    file "$LOCAL_BIN"
+    command -v file >/dev/null && file "$LOCAL_BIN" || true
     sha256sum "$LOCAL_BIN" | tee "${LOCAL_BIN}.sha256"
   else
     # Always compile committed HEAD in an isolated worktree so local dirt cannot taint the binary.
@@ -144,7 +144,7 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
     )
     cleanup_wt
     trap - EXIT
-    file "$LOCAL_BIN"
+    command -v file >/dev/null && file "$LOCAL_BIN" || true
     sha256sum "$LOCAL_BIN" | tee "${LOCAL_BIN}.sha256"
     if go version -m "$LOCAL_BIN" 2>/dev/null | grep -qE '\+dirty|vcs.modified=true'; then
       die "built binary still reports dirty VCS metadata; refuse prod deploy"
@@ -190,7 +190,13 @@ ssh -o ConnectTimeout=20 -o BatchMode=yes "$SSH_HOST" \
   bash -s <<'EOS'
 set -euo pipefail
 
-fail() { echo "ERROR: $*" >&2; exit 1; }
+fail() {
+  echo "ERROR: $*" >&2
+  if [[ "${INSTALLED:-0}" == "1" && -f "$REMOTE_BAK" ]]; then
+    cp -a "$REMOTE_BAK" "$REMOTE_BIN" && systemctl restart "$SERVICE" && echo "AUTO_ROLLBACK=restored $REMOTE_BAK" >&2
+  fi
+  exit 1
+}
 
 NEW_SHA=$(sha256sum "$REMOTE_NEW" | awk '{print $1}')
 echo "NEW_SHA=$NEW_SHA expected=$LOCAL_SHA"
@@ -220,6 +226,7 @@ else
 fi
 
 install -m 0755 "$REMOTE_NEW" "$REMOTE_BIN"
+INSTALLED=1
 rm -f "$REMOTE_NEW"
 BIN_SHA=$(sha256sum "$REMOTE_BIN" | awk '{print $1}')
 [[ "$BIN_SHA" == "$LOCAL_SHA" ]] || fail "installed binary sha mismatch"

@@ -146,7 +146,13 @@ ssh -o ConnectTimeout=20 -o BatchMode=yes "$SSH_HOST" \
       SKIP_PANEL_CHECK="$SKIP_PANEL_CHECK" \
   bash -s <<'EOS'
 set -euo pipefail
-fail() { echo "ERROR: $*" >&2; exit 1; }
+fail() {
+  echo "ERROR: $*" >&2
+  if [[ "${INSTALLED:-0}" == "1" && -f "$REMOTE_BAK" ]]; then
+    cp -a "$REMOTE_BAK" "$REMOTE_FILE" && echo "AUTO_ROLLBACK=restored $REMOTE_BAK" >&2
+  fi
+  exit 1
+}
 
 mkdir -p "$REMOTE_STATIC"
 
@@ -182,6 +188,7 @@ if [[ -f "$REMOTE_FILE" ]]; then
 fi
 
 install -m 0644 "$REMOTE_NEW" "$REMOTE_FILE"
+INSTALLED=1
 rm -f "$REMOTE_NEW"
 FILE_SHA=$(sha256sum "$REMOTE_FILE" | awk '{print $1}')
 [[ "$FILE_SHA" == "$LOCAL_SHA" ]] || fail "installed management.html sha mismatch"
