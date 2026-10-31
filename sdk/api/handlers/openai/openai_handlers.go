@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -58,6 +59,13 @@ func (h *OpenAIAPIHandler) Models() []map[string]any {
 	return modelRegistry.GetAvailableModels("openai")
 }
 
+func supportedEndpointTypes(model map[string]any) []string {
+	if ownedBy, _ := model["owned_by"].(string); strings.EqualFold(ownedBy, "anthropic") {
+		return []string{"anthropic"}
+	}
+	return []string{"openai"}
+}
+
 // OpenAIModels handles the /v1/models endpoint.
 // It returns a list of available AI models with their capabilities
 // and specifications in OpenAI-compatible format.
@@ -81,7 +89,7 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	// Get all available models
 	allModels := h.Models()
 
-	// Filter to only include the 4 required fields: id, object, created, owned_by
+	// Keep the OpenAI model fields and advertise the protocol each model uses.
 	filteredModels := make([]map[string]any, len(allModels))
 	for i, model := range allModels {
 		filteredModel := map[string]any{
@@ -98,6 +106,8 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 		if ownedBy, exists := model["owned_by"]; exists {
 			filteredModel["owned_by"] = ownedBy
 		}
+
+		filteredModel["supported_endpoint_types"] = supportedEndpointTypes(model)
 
 		filteredModels[i] = filteredModel
 	}
