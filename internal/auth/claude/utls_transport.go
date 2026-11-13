@@ -215,6 +215,16 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 		ForceAttemptHTTP2: false,
 		DialTLSContext:    roundTripper.dialTLSContext,
 	}
+	// DialTLSContext serves HTTPS (including the real OAuth refresh path) via
+	// the proxy-aware dialer. Plain HTTP does not use DialTLSContext, so a
+	// configured HTTP(S) proxy must also be installed on Transport.Proxy or
+	// those requests, and HTTPS-to-HTTP redirects, would dial the target directly.
+	if setting, errParse := proxyutil.Parse(proxyURL); errParse == nil && setting.Mode == proxyutil.ModeProxy && setting.URL != nil {
+		scheme := strings.ToLower(setting.URL.Scheme)
+		if scheme == "http" || scheme == "https" {
+			roundTripper.transport.Proxy = http.ProxyURL(setting.URL)
+		}
+	}
 	return roundTripper
 }
 
@@ -270,5 +280,41 @@ func (t *utlsRoundTripper) CloseIdleConnections() {
 }
 
 func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
-	return &http.Client{Transport: anthropicRoundTripper(cfg)}
+	transport := anthropicRoundTripper(cfg)
+	client := &http.Client{Transport: transport}
+	if cfg != nil && cfg.ProxyFailClosed {
+		client.Transport = httpsOnlyFailClosedTransport{base: transport}
+		client.CheckRedirect = failClosedHTTPSRedirect
+	}
+	return client
+}
+
+// httpsOnlyFailClosedTransport rejects non-HTTPS requests so a configured
+// proxy cannot be bypassed by an HTTP hop or an HTTPS-to-HTTP redirect.
+type httpsOnlyFailClosedTransport struct {
+	base http.RoundTripper
+}
+
+func (t httpsOnlyFailClosedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil || req.URL == nil || strings.ToLower(req.URL.Scheme) != "https" {
+		scheme := ""
+		if req != nil && req.URL != nil {
+			scheme = req.URL.Scheme
+		}
+		return nil, fmt.Errorf("proxy fail-closed: refusing non-https request (%s)", scheme)
+	}
+	if t.base == nil {
+		return nil, fmt.Errorf("proxy fail-closed: refusing non-https request (missing transport)")
+	}
+	return t.base.RoundTrip(req)
+}
+
+func failClosedHTTPSRedirect(req *http.Request, via []*http.Request) error {
+	if req == nil || req.URL == nil || strings.ToLower(req.URL.Scheme) != "https" {
+		return fmt.Errorf("proxy fail-closed: refusing non-https redirect")
+	}
+	if len(via) >= 10 {
+		return fmt.Errorf("stopped after 10 redirects")
+	}
+	return nil
 }
