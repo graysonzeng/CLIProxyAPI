@@ -174,6 +174,26 @@ type utlsRoundTripper struct {
 	transport    *http.Transport
 }
 
+func anthropicRoundTripper(cfg *config.SDKConfig) http.RoundTripper {
+	if cfg != nil && cfg.ProxyFailClosed {
+		reason := proxyutil.HTTPFailClosedReason(cfg.ProxyURL)
+		if reason == "" {
+			proxyDialer, mode, errBuild := proxyutil.BuildDialer(cfg.ProxyURL)
+			if errBuild != nil || proxyDialer == nil || mode != proxyutil.ModeProxy {
+				reason = "proxy transport build failed"
+				if errBuild != nil {
+					reason = errBuild.Error()
+				}
+			}
+		}
+		if reason != "" {
+			log.Errorf("proxy fail-closed: %s", reason)
+			return proxyutil.NewFailClosedTransport(reason)
+		}
+	}
+	return newUtlsRoundTripper(cfg)
+}
+
 func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 	var dialer proxy.Dialer = proxy.Direct
 	var proxyURL string
@@ -250,5 +270,5 @@ func (t *utlsRoundTripper) CloseIdleConnections() {
 }
 
 func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
-	return &http.Client{Transport: newUtlsRoundTripper(cfg)}
+	return &http.Client{Transport: anthropicRoundTripper(cfg)}
 }

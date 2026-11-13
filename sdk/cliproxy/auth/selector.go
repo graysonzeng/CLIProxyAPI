@@ -961,7 +961,7 @@ func getSelectorAvailableAuthsWithPriorityMode(ctx context.Context, auths []*Aut
 			// unrelated cooldowns. Affinity bindings may span all priority tiers, but
 			// fallback selection must still use the highest available tier.
 			if !allPriorities {
-				return highestPriorityAuths(auths), nil
+				return highestPriorityPreferredAuths(auths), nil
 			}
 			return auths, nil
 		}
@@ -1001,7 +1001,11 @@ func getAvailableAuthsWithPriorityModeForRequest(ctx context.Context, auths []*A
 		return nil, newAuthUnavailableError(earliest, now)
 	}
 
-	return availableAuthsFromPriorityBuckets(availableByPriority, allPriorities), nil
+	available := availableAuthsFromPriorityBuckets(availableByPriority, allPriorities)
+	if !allPriorities {
+		available = preferFirstPartyOverOpenAICompat(available)
+	}
+	return available, nil
 }
 
 // availableAuthsFromPriorityBuckets flattens availability buckets into a stable, ID-sorted slice.
@@ -1071,6 +1075,48 @@ func highestPriorityAuths(auths []*Auth) []*Auth {
 }
 
 // Pick selects the next available auth for the provider in a round-robin manner.
+
+// isOpenAICompatibilityAuth reports whether auth is an openai-compatibility
+// (API-key / compat group) credential rather than a first-party OAuth file.
+func isOpenAICompatibilityAuth(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if strings.TrimSpace(auth.Attributes["compat_name"]) != "" {
+		return true
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	return strings.HasPrefix(provider, "openai-compat")
+}
+
+// preferFirstPartyOverOpenAICompat drops openai-compatibility auths when at
+// least one first-party OAuth (or other non-compat) auth is still present.
+// If only compat auths remain, they are kept so fallback still works after
+// first-party credentials are exhausted.
+func preferFirstPartyOverOpenAICompat(auths []*Auth) []*Auth {
+	if len(auths) == 0 {
+		return auths
+	}
+	firstParty := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth != nil && !isOpenAICompatibilityAuth(auth) {
+			firstParty = append(firstParty, auth)
+		}
+	}
+	if len(firstParty) > 0 {
+		return firstParty
+	}
+	return auths
+}
+
+// highestPriorityPreferredAuths narrows to the highest priority tier, then
+// prefers first-party OAuth over same-priority openai-compatibility groups
+// for the first bind. A strictly higher explicit compat priority is unchanged
+// because highestPriorityAuths already selected that tier alone.
+func highestPriorityPreferredAuths(auths []*Auth) []*Auth {
+	return preferFirstPartyOverOpenAICompat(highestPriorityAuths(auths))
+}
+
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
@@ -1675,7 +1721,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil && !s.rebindOnNever {
 		return nil, err
 	}
-	fallbackAuths := highestPriorityAuths(available)
+	fallbackAuths := highestPriorityPreferredAuths(available)
 
 	modelKey := canonicalModelKey(model)
 	cacheKey := provider + "::" + primaryID + "::" + modelKey
@@ -1936,7 +1982,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	if errAvailable != nil {
 		return nil, true, errAvailable
 	}
-	fallbackAuths := highestPriorityAuths(available)
+	fallbackAuths := highestPriorityPreferredAuths(available)
 	auth, errPick := s.pickWithAffinityReservation(ctx, provider, model, opts, fallbackAuths, nil, reservation)
 	if errPick != nil {
 		return nil, true, errPick
