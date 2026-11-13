@@ -171,7 +171,14 @@ type utlsRoundTripper struct {
 	// short-lived ClaudeAuth instances can still resume, while resumption never
 	// crosses proxy boundaries.
 	sessionCache tls.ClientSessionCache
-	transport    *http.Transport
+	// transport handles HTTPS via DialTLSContext, which uses the proxy-aware
+	// dialer and then the Claude uTLS / ordered-header path. It must not set
+	// Transport.Proxy: net/http would CONNECT and then addTLS with standard
+	// crypto/tls, skipping DialTLSContext.
+	transport *http.Transport
+	// plainHTTP is used only for http:// targets when a proxy is configured,
+	// so default mode cannot fall back to a direct dial. HTTPS never uses it.
+	plainHTTP http.RoundTripper
 }
 
 func anthropicRoundTripper(cfg *config.SDKConfig) http.RoundTripper {
@@ -215,14 +222,16 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 		ForceAttemptHTTP2: false,
 		DialTLSContext:    roundTripper.dialTLSContext,
 	}
-	// DialTLSContext serves HTTPS (including the real OAuth refresh path) via
-	// the proxy-aware dialer. Plain HTTP does not use DialTLSContext, so a
-	// configured HTTP(S) proxy must also be installed on Transport.Proxy or
-	// those requests, and HTTPS-to-HTTP redirects, would dial the target directly.
+	// Plain HTTP does not use DialTLSContext. Keep a separate proxied
+	// transport for those requests only, including HTTPS-to-HTTP redirects
+	// in default mode. Fail-closed still rejects non-HTTPS at the client.
 	if setting, errParse := proxyutil.Parse(proxyURL); errParse == nil && setting.Mode == proxyutil.ModeProxy && setting.URL != nil {
 		scheme := strings.ToLower(setting.URL.Scheme)
 		if scheme == "http" || scheme == "https" {
-			roundTripper.transport.Proxy = http.ProxyURL(setting.URL)
+			roundTripper.plainHTTP = &http.Transport{
+				ForceAttemptHTTP2: false,
+				Proxy:             http.ProxyURL(setting.URL),
+			}
 		}
 	}
 	return roundTripper
@@ -272,11 +281,17 @@ func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr str
 }
 
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req != nil && req.URL != nil && strings.EqualFold(req.URL.Scheme, "http") && t.plainHTTP != nil {
+		return t.plainHTTP.RoundTrip(req)
+	}
 	return t.transport.RoundTrip(req)
 }
 
 func (t *utlsRoundTripper) CloseIdleConnections() {
 	t.transport.CloseIdleConnections()
+	if idle, ok := t.plainHTTP.(interface{ CloseIdleConnections() }); ok {
+		idle.CloseIdleConnections()
+	}
 }
 
 func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
