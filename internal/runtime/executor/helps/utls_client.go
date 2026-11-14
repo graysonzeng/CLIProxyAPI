@@ -500,6 +500,27 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 	}()
 	proxyURL := effectiveProxyURL(ctx, cfg, auth)
 
+	failClosed := cfg != nil && cfg.ProxyFailClosed
+	if failClosed {
+		reason := httpProxyFailClosedReason(proxyURL)
+		if reason == "" {
+			if _, mode, errBuild := proxyutil.BuildDialer(proxyURL); errBuild != nil || mode != proxyutil.ModeProxy {
+				reason = "proxy transport build failed"
+				if errBuild != nil {
+					reason = errBuild.Error()
+				}
+			}
+		}
+		if reason != "" {
+			log.Errorf("proxy fail-closed: %s", reason)
+			client := &http.Client{Transport: proxyutil.NewFailClosedTransport(reason)}
+			if timeout > 0 {
+				client.Timeout = timeout
+			}
+			return client
+		}
+	}
+
 	var ctxRoundTripper http.RoundTripper
 	if ctx != nil {
 		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
