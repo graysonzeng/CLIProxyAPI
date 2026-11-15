@@ -42,6 +42,12 @@ type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// ProxyFailClosed, when true, refuses to fall back to a context or default
+	// transport if an explicit proxy cannot be used. Empty, direct/none, and
+	// non-HTTP(S) proxy schemes are also rejected, so requests fail instead of
+	// leaving the machine on a direct path.
+	ProxyFailClosed bool `yaml:"proxy-fail-closed" json:"proxy-fail-closed"`
+
 	// TLSHandshakeTimeoutSeconds bounds upstream TLS handshakes made by the
 	// shared uTLS client, in seconds. It applies to both the Claude Code
 	// Anthropic transport and the Chrome ChatGPT/Codex transport; the
