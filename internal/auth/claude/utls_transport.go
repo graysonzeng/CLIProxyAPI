@@ -171,7 +171,34 @@ type utlsRoundTripper struct {
 	// short-lived ClaudeAuth instances can still resume, while resumption never
 	// crosses proxy boundaries.
 	sessionCache tls.ClientSessionCache
-	transport    *http.Transport
+	// transport handles HTTPS via DialTLSContext, which uses the proxy-aware
+	// dialer and then the Claude uTLS / ordered-header path. It must not set
+	// Transport.Proxy: net/http would CONNECT and then addTLS with standard
+	// crypto/tls, skipping DialTLSContext.
+	transport *http.Transport
+	// plainHTTP is used only for http:// targets when a proxy is configured,
+	// so default mode cannot fall back to a direct dial. HTTPS never uses it.
+	plainHTTP http.RoundTripper
+}
+
+func anthropicRoundTripper(cfg *config.SDKConfig) http.RoundTripper {
+	if cfg != nil && cfg.ProxyFailClosed {
+		reason := proxyutil.HTTPFailClosedReason(cfg.ProxyURL)
+		if reason == "" {
+			proxyDialer, mode, errBuild := proxyutil.BuildDialer(cfg.ProxyURL)
+			if errBuild != nil || proxyDialer == nil || mode != proxyutil.ModeProxy {
+				reason = "proxy transport build failed"
+				if errBuild != nil {
+					reason = errBuild.Error()
+				}
+			}
+		}
+		if reason != "" {
+			log.Errorf("proxy fail-closed: %s", reason)
+			return proxyutil.NewFailClosedTransport(reason)
+		}
+	}
+	return newUtlsRoundTripper(cfg)
 }
 
 func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
@@ -194,6 +221,18 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 	roundTripper.transport = &http.Transport{
 		ForceAttemptHTTP2: false,
 		DialTLSContext:    roundTripper.dialTLSContext,
+	}
+	// Plain HTTP does not use DialTLSContext. Keep a separate proxied
+	// transport for those requests only, including HTTPS-to-HTTP redirects
+	// in default mode. Fail-closed still rejects non-HTTPS at the client.
+	if setting, errParse := proxyutil.Parse(proxyURL); errParse == nil && setting.Mode == proxyutil.ModeProxy && setting.URL != nil {
+		scheme := strings.ToLower(setting.URL.Scheme)
+		if scheme == "http" || scheme == "https" {
+			roundTripper.plainHTTP = &http.Transport{
+				ForceAttemptHTTP2: false,
+				Proxy:             http.ProxyURL(setting.URL),
+			}
+		}
 	}
 	return roundTripper
 }
@@ -242,13 +281,55 @@ func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr str
 }
 
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req != nil && req.URL != nil && strings.EqualFold(req.URL.Scheme, "http") && t.plainHTTP != nil {
+		return t.plainHTTP.RoundTrip(req)
+	}
 	return t.transport.RoundTrip(req)
 }
 
 func (t *utlsRoundTripper) CloseIdleConnections() {
 	t.transport.CloseIdleConnections()
+	if idle, ok := t.plainHTTP.(interface{ CloseIdleConnections() }); ok {
+		idle.CloseIdleConnections()
+	}
 }
 
 func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
-	return &http.Client{Transport: newUtlsRoundTripper(cfg)}
+	transport := anthropicRoundTripper(cfg)
+	client := &http.Client{Transport: transport}
+	if cfg != nil && cfg.ProxyFailClosed {
+		client.Transport = httpsOnlyFailClosedTransport{base: transport}
+		client.CheckRedirect = failClosedHTTPSRedirect
+	}
+	return client
+}
+
+// httpsOnlyFailClosedTransport rejects non-HTTPS requests so a configured
+// proxy cannot be bypassed by an HTTP hop or an HTTPS-to-HTTP redirect.
+type httpsOnlyFailClosedTransport struct {
+	base http.RoundTripper
+}
+
+func (t httpsOnlyFailClosedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil || req.URL == nil || strings.ToLower(req.URL.Scheme) != "https" {
+		scheme := ""
+		if req != nil && req.URL != nil {
+			scheme = req.URL.Scheme
+		}
+		return nil, fmt.Errorf("proxy fail-closed: refusing non-https request (%s)", scheme)
+	}
+	if t.base == nil {
+		return nil, fmt.Errorf("proxy fail-closed: refusing non-https request (missing transport)")
+	}
+	return t.base.RoundTrip(req)
+}
+
+func failClosedHTTPSRedirect(req *http.Request, via []*http.Request) error {
+	if req == nil || req.URL == nil || strings.ToLower(req.URL.Scheme) != "https" {
+		return fmt.Errorf("proxy fail-closed: refusing non-https redirect")
+	}
+	if len(via) >= 10 {
+		return fmt.Errorf("stopped after 10 redirects")
+	}
+	return nil
 }
