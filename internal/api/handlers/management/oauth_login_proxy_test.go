@@ -215,22 +215,59 @@ func TestAntigravityManagementOAuthUsesConfigLoginProxy(t *testing.T) {
 
 func TestAntigravityManagementOAuthRejectsInvalidLoginProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	secret := "proxy-userinfo-secret-pass"
+	invalidWithUserinfo := []string{
+		"://bad",
+		"http://proxy-user:" + secret + "@",
+		"http://proxy-user:" + secret + "@127.0.0.1:99999",
+		"ftp://proxy-user:" + secret + "@127.0.0.1:21",
+		"direct",
+	}
+	for _, badProxy := range invalidWithUserinfo {
+		t.Run(badProxy, func(t *testing.T) {
+			h := NewHandlerWithoutConfigFilePath(&config.Config{
+				AuthDir:       t.TempDir(),
+				Port:          8317,
+				LoginProxyURL: badProxy,
+				SDKConfig:     config.SDKConfig{ProxyFailClosed: true},
+			}, nil)
+			router := gin.New()
+			router.POST("/v8/management/oauth/auth-url", h.StartOAuthV8)
+
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v8/management/oauth/auth-url", strings.NewReader(`{"provider":"antigravity"}`)))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 for invalid oauth.login-proxy; body=%s", rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			if body != `{"error":"invalid login-proxy"}` && !strings.Contains(body, `"invalid login-proxy"`) {
+				t.Fatalf("unexpected error body: %s", body)
+			}
+			if strings.Contains(body, secret) || strings.Contains(body, badProxy) || strings.Contains(body, "proxy-user") {
+				t.Fatalf("error body leaked proxy userinfo/raw value: %s", body)
+			}
+		})
+	}
+}
+
+func TestGetConfigJSONOmitsLoginProxyURL(t *testing.T) {
+	gin.SetMode(gin.TestMode)
 	h := NewHandlerWithoutConfigFilePath(&config.Config{
 		AuthDir:       t.TempDir(),
 		Port:          8317,
-		LoginProxyURL: "://bad",
-		SDKConfig:     config.SDKConfig{ProxyFailClosed: true},
+		LoginProxyURL: "http://proxy-user:json-leak-secret@127.0.0.1:7890",
+		SDKConfig:     config.SDKConfig{ProxyURL: "", ProxyFailClosed: true},
 	}, nil)
 	router := gin.New()
-	router.POST("/v8/management/oauth/auth-url", h.StartOAuthV8)
-
+	router.GET("/config", h.GetConfig)
 	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v8/management/oauth/auth-url", strings.NewReader(`{"provider":"antigravity"}`)))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 for invalid oauth.login-proxy; body=%s", rec.Code, rec.Body.String())
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
-	if strings.Contains(rec.Body.String(), "://bad") {
-		t.Fatalf("error body leaked invalid proxy raw value: %s", rec.Body.String())
+	body := rec.Body.String()
+	if strings.Contains(body, "login-proxy") || strings.Contains(body, "LoginProxy") || strings.Contains(body, "json-leak-secret") || strings.Contains(body, "proxy-user") {
+		t.Fatalf("GetConfig JSON leaked login-proxy: %s", body)
 	}
 }
 
