@@ -14,118 +14,129 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-func TestIssue7431_LargeWeightedPoolRotatesAcrossTransientExclusionsAndCooldowns(t *testing.T) {
-	for _, withAffinity := range []bool{false, true} {
-		name := "scheduler-fast-path"
-		if withAffinity {
-			name = "session-affinity-legacy"
+// The two Issue7431 large-pool cases keep identical credentials, pick counts,
+// failure injection, and assertions. They are split into top-level tests so a
+// race run can bound each case without shrinking the pool or deleting coverage.
+// Together they exceed a 120s package-level -race budget; each case is about
+// one minute under the race detector and has been observed to complete with
+// no DATA RACE when run on its own.
+func TestIssue7431_LargeWeightedPoolRotatesAcrossTransientExclusionsAndCooldowns_SchedulerFastPath(t *testing.T) {
+	runIssue7431LargeWeightedPool(t, false)
+}
+
+func TestIssue7431_LargeWeightedPoolRotatesAcrossTransientExclusionsAndCooldowns_SessionAffinityLegacy(t *testing.T) {
+	runIssue7431LargeWeightedPool(t, true)
+}
+
+func runIssue7431LargeWeightedPool(t *testing.T, withAffinity bool) {
+	t.Helper()
+	name := "scheduler-fast-path"
+	if withAffinity {
+		name = "session-affinity-legacy"
+	}
+	const (
+		totalCreds   = 1080
+		model        = "issue-7431-large-wrr-model"
+		compatName   = "issue-7431-pool"
+		totalPicks   = 1120
+		failingEvery = 40
+	)
+	providerKey := util.OpenAICompatibleProviderKey(compatName)
+	disableCooling := true
+	retryCount := 4
+	cfg := &internalconfig.Config{
+		RequestRetry: retryCount,
+		OpenAICompatibility: []internalconfig.OpenAICompatibility{{
+			Name:           compatName,
+			BaseURL:        "https://example.invalid/v1",
+			DisableCooling: &disableCooling,
+			Models:         []internalconfig.OpenAICompatibilityModel{{Name: model, Alias: model}},
+			RequestScopedErrors: []internalconfig.RequestScopedErrorRule{{
+				Status: http.StatusTooManyRequests,
+				Match:  []string{"server_busy"},
+				Action: RequestScopedActionContinueAndCooldown,
+			}},
+		}},
+	}
+
+	weighted := &WeightedRoundRobinSelector{}
+	var selector Selector = weighted
+	if withAffinity {
+		affinity := NewSessionAffinitySelector(weighted)
+		t.Cleanup(affinity.Stop)
+		selector = affinity
+	}
+
+	manager := NewManager(nil, selector, nil)
+	manager.SetConfig(cfg)
+	manager.SetRetryConfig(retryCount, 0, 0)
+
+	reg := registry.GetGlobalRegistry()
+	authIDs := make([]string, totalCreds)
+	failSet := make(map[string]bool)
+	for i := 0; i < totalCreds; i++ {
+		id := fmt.Sprintf("thk-%s-%04d", name, i)
+		authIDs[i] = id
+		// First 4 IDs and every 40th ID fail with 429 so transient exclusions churn continuously.
+		if i < 4 || i%failingEvery == 0 {
+			failSet[id] = true
 		}
-		t.Run(name, func(t *testing.T) {
-			const (
-				totalCreds   = 1080
-				model        = "issue-7431-large-wrr-model"
-				compatName   = "issue-7431-pool"
-				totalPicks   = 1120
-				failingEvery = 40
-			)
-			providerKey := util.OpenAICompatibleProviderKey(compatName)
-			disableCooling := true
-			retryCount := 4
-			cfg := &internalconfig.Config{
-				RequestRetry: retryCount,
-				OpenAICompatibility: []internalconfig.OpenAICompatibility{{
-					Name:           compatName,
-					BaseURL:        "https://example.invalid/v1",
-					DisableCooling: &disableCooling,
-					Models:         []internalconfig.OpenAICompatibilityModel{{Name: model, Alias: model}},
-					RequestScopedErrors: []internalconfig.RequestScopedErrorRule{{
-						Status: http.StatusTooManyRequests,
-						Match:  []string{"server_busy"},
-						Action: RequestScopedActionContinueAndCooldown,
-					}},
-				}},
-			}
+		auth := &Auth{
+			ID:       id,
+			Provider: providerKey,
+			Status:   StatusActive,
+			Attributes: map[string]string{
+				"auth_kind":    "apikey",
+				"api_key":      fmt.Sprintf("key-%04d", i),
+				"compat_name":  compatName,
+				"provider_key": providerKey,
+			},
+		}
+		reg.RegisterClient(id, providerKey, []*registry.ModelInfo{{ID: model}})
+		if _, errReg := manager.Register(WithSkipPersist(t.Context()), auth); errReg != nil {
+			t.Fatalf("register %s: %v", id, errReg)
+		}
+	}
+	t.Cleanup(func() {
+		for _, id := range authIDs {
+			reg.UnregisterClient(id)
+		}
+	})
 
-			weighted := &WeightedRoundRobinSelector{}
-			var selector Selector = weighted
-			if withAffinity {
-				affinity := NewSessionAffinitySelector(weighted)
-				t.Cleanup(affinity.Stop)
-				selector = affinity
-			}
-
-			manager := NewManager(nil, selector, nil)
-			manager.SetConfig(cfg)
-			manager.SetRetryConfig(retryCount, 0, 0)
-
-			reg := registry.GetGlobalRegistry()
-			authIDs := make([]string, totalCreds)
-			failSet := make(map[string]bool)
-			for i := 0; i < totalCreds; i++ {
-				id := fmt.Sprintf("thk-%s-%04d", name, i)
-				authIDs[i] = id
-				// First 4 IDs and every 40th ID fail with 429 so transient exclusions churn continuously.
-				if i < 4 || i%failingEvery == 0 {
-					failSet[id] = true
-				}
-				auth := &Auth{
-					ID:       id,
-					Provider: providerKey,
-					Status:   StatusActive,
-					Attributes: map[string]string{
-						"auth_kind":    "apikey",
-						"api_key":      fmt.Sprintf("key-%04d", i),
-						"compat_name":  compatName,
-						"provider_key": providerKey,
-					},
-				}
-				reg.RegisterClient(id, providerKey, []*registry.ModelInfo{{ID: model}})
-				if _, errReg := manager.Register(WithSkipPersist(t.Context()), auth); errReg != nil {
-					t.Fatalf("register %s: %v", id, errReg)
+	selectedCounts := make(map[string]int, totalCreds)
+	manager.RegisterExecutor(&mockCustomErrorExecutor{
+		identifier: providerKey,
+		executeFn: func(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+			selectedCounts[auth.ID]++
+			if failSet[auth.ID] {
+				return cliproxyexecutor.Response{}, customStatusError{
+					code: http.StatusTooManyRequests,
+					msg:  "server_busy",
 				}
 			}
-			t.Cleanup(func() {
-				for _, id := range authIDs {
-					reg.UnregisterClient(id)
-				}
-			})
+			return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+		},
+	})
 
-			selectedCounts := make(map[string]int, totalCreds)
-			manager.RegisterExecutor(&mockCustomErrorExecutor{
-				identifier: providerKey,
-				executeFn: func(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-					selectedCounts[auth.ID]++
-					if failSet[auth.ID] {
-						return cliproxyexecutor.Response{}, customStatusError{
-							code: http.StatusTooManyRequests,
-							msg:  "server_busy",
-						}
-					}
-					return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
-				},
-			})
+	for reqIdx := 0; reqIdx < totalPicks; reqIdx++ {
+		opts := cliproxyexecutor.Options{}
+		if withAffinity {
+			opts.Headers = http.Header{"Session_id": {fmt.Sprintf("req-session-%d", reqIdx)}}
+		}
+		if _, errExec := manager.Execute(t.Context(), []string{providerKey}, cliproxyexecutor.Request{Model: model}, opts); errExec != nil {
+			t.Fatalf("request %d failed: %v", reqIdx, errExec)
+		}
+	}
 
-			for reqIdx := 0; reqIdx < totalPicks; reqIdx++ {
-				opts := cliproxyexecutor.Options{}
-				if withAffinity {
-					opts.Headers = http.Header{"Session_id": {fmt.Sprintf("req-session-%d", reqIdx)}}
-				}
-				if _, errExec := manager.Execute(t.Context(), []string{providerKey}, cliproxyexecutor.Request{Model: model}, opts); errExec != nil {
-					t.Fatalf("request %d failed: %v", reqIdx, errExec)
-				}
-			}
-
-			healthySelected := 0
-			for _, id := range authIDs {
-				if !failSet[id] && selectedCounts[id] > 0 {
-					healthySelected++
-				}
-			}
-			wantMinHealthy := totalCreds - len(failSet) - 10
-			if healthySelected < wantMinHealthy {
-				t.Fatalf("large WRR pool collapsed: only %d/%d healthy credentials selected across %d requests", healthySelected, totalCreds-len(failSet), totalPicks)
-			}
-		})
+	healthySelected := 0
+	for _, id := range authIDs {
+		if !failSet[id] && selectedCounts[id] > 0 {
+			healthySelected++
+		}
+	}
+	wantMinHealthy := totalCreds - len(failSet) - 10
+	if healthySelected < wantMinHealthy {
+		t.Fatalf("large WRR pool collapsed: only %d/%d healthy credentials selected across %d requests", healthySelected, totalCreds-len(failSet), totalPicks)
 	}
 }
 
