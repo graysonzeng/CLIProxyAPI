@@ -485,7 +485,17 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
 	// Native Antigravity reuses one transport across requests. Opt into a
 	// credential-scoped proxy transport only here so other providers keep their
 	// existing lifecycle and different OAuth identities remain isolated.
-	if proxyURL := antigravityProxyURL(ctx, cfg, auth); proxyURL != "" {
+	proxyURL := antigravityProxyURL(ctx, cfg, auth)
+	// Strict mode must run before the proxied HTTP/1.1 fast path. BuildHTTPTransport
+	// accepts direct/none/SOCKS and would otherwise return a working transport
+	// that never reaches NewProxyAwareHTTPClient's fail-closed checks.
+	if cfg != nil && cfg.ProxyFailClosed {
+		if reason := proxyutil.HTTPFailClosedReason(proxyURL); reason != "" {
+			log.Errorf("proxy fail-closed: %s", reason)
+			return &http.Client{Transport: proxyutil.NewFailClosedTransport(reason), Timeout: timeout}
+		}
+	}
+	if proxyURL != "" {
 		if transport := antigravityProxiedHTTP11Transport(auth, proxyURL, cfg); transport != nil {
 			return &http.Client{Transport: transport, Timeout: timeout}
 		}
