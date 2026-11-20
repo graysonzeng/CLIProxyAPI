@@ -389,3 +389,54 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 	}
 	return c.Conn.Read(p)
 }
+
+// HTTPFailClosedReason returns a secret-free reason when fail-closed mode must
+// reject the proxy setting. An empty string means the setting is an HTTP or
+// HTTPS proxy URL and may be built.
+func HTTPFailClosedReason(proxyURL string) string {
+	setting, errParse := Parse(proxyURL)
+	if errParse != nil || setting.Mode == ModeInvalid {
+		if errParse != nil {
+			return errParse.Error()
+		}
+		return "invalid proxy URL"
+	}
+	if setting.Mode == ModeInherit {
+		return "empty proxy is forbidden"
+	}
+	if setting.Mode == ModeDirect {
+		return "direct/none proxy is forbidden"
+	}
+	scheme := ""
+	if setting.URL != nil {
+		scheme = strings.ToLower(setting.URL.Scheme)
+	}
+	if scheme != "http" && scheme != "https" {
+		return "non-http proxy scheme is forbidden"
+	}
+	return ""
+}
+
+// FailClosedTransport is a RoundTripper that never dials. It is installed when
+// ProxyFailClosed is set and the effective proxy cannot be used, so the request
+// cannot fall back to a direct or inherited transport.
+type FailClosedTransport struct {
+	Reason string
+}
+
+// NewFailClosedTransport returns a fail-closed RoundTripper with the given reason.
+func NewFailClosedTransport(reason string) *FailClosedTransport {
+	return &FailClosedTransport{Reason: reason}
+}
+
+// RoundTrip always returns a fail-closed error and never forwards the request.
+func (t *FailClosedTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	reason := ""
+	if t != nil {
+		reason = t.Reason
+	}
+	if reason == "" {
+		reason = "proxy setup failed"
+	}
+	return nil, fmt.Errorf("proxy fail-closed: refusing direct fallback (%s)", reason)
+}

@@ -69,9 +69,8 @@ func Enqueue(payload []byte) {
 	if len(payload) == 0 {
 		return
 	}
-	if global.publishToSubscribers(payload) {
-		return
-	}
+	// Subscribers and polling consumers receive independent copies of each record.
+	global.publishToSubscribers(payload)
 	global.enqueue(payload)
 }
 
@@ -138,12 +137,12 @@ func (q *queue) enqueue(payload []byte) {
 	q.maybeCompactLocked()
 }
 
-func (q *queue) publishToSubscribers(payload []byte) bool {
+func (q *queue) publishToSubscribers(payload []byte) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	if len(q.subscribers) == 0 {
-		return false
+		return
 	}
 
 	for id, subscriber := range q.subscribers {
@@ -155,8 +154,6 @@ func (q *queue) publishToSubscribers(payload []byte) bool {
 			close(subscriber)
 		}
 	}
-
-	return true
 }
 
 func (q *queue) subscribe(buffer int, initialPayload []byte) (<-chan []byte, func()) {

@@ -86,6 +86,32 @@ func oauthSessionExtraMetadataFromContext(c *gin.Context) map[string]any {
 	return cloneOAuthSessionMetadata(meta)
 }
 
+// applyConfiguredLoginProxyIfNeeded fills the OAuth session proxy from
+// oauth.login-proxy when the request did not supply a per-session proxy_url.
+// Per-request proxy_url always wins. The shared requests.proxy-url is never
+// read or mutated here.
+func (h *Handler) applyConfiguredLoginProxyIfNeeded(c *gin.Context) error {
+	if oauthSessionProxyURLFromContext(c) != "" {
+		return nil
+	}
+	cfg := h.configSnapshot()
+	if cfg == nil {
+		return nil
+	}
+	loginProxy := strings.TrimSpace(cfg.LoginProxyURL)
+	if loginProxy == "" {
+		return nil
+	}
+	validated, errProxy := validateOAuthSessionProxyURL(loginProxy)
+	if errProxy != nil {
+		return errProxy
+	}
+	if validated != "" {
+		c.Set(oauthSessionProxyURLContextKey, validated)
+	}
+	return nil
+}
+
 func validateOAuthSessionProxyURL(raw string) (string, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -396,6 +422,11 @@ func (h *Handler) StartOAuthV8(c *gin.Context) {
 			VerifyAfterLogin: verifyAfterLogin,
 			VerifyModel:      verifyModel,
 		})
+	}
+
+	if errApply := h.applyConfiguredLoginProxyIfNeeded(c); errApply != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid login-proxy"})
+		return
 	}
 
 	c.Set(oauthSessionProviderContextKey, provider)
