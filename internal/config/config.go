@@ -67,6 +67,15 @@ type Config struct {
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
 
+	// LoginProxyURL is the dedicated proxy used for management/CLI OAuth login
+	// bootstrap (auth-url, token exchange, and mandatory account bootstrap
+	// requests) when a per-session proxy_url is not supplied. It is persisted
+	// onto newly saved credentials as proxy_url. It does not set or replace
+	// requests.proxy-url / SDKConfig.ProxyURL, so unrelated API-key providers
+	// that rely on an empty global proxy keep their intended egress.
+	// Configured under oauth.login-proxy in v8 YAML.
+	LoginProxyURL string `yaml:"login-proxy" json:"-"`
+
 	// Debug enables or disables debug-level logging and other debug features.
 	Debug bool `yaml:"debug" json:"debug"`
 
