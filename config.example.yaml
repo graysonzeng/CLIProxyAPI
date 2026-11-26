@@ -1084,6 +1084,15 @@ oauth:
   # Authentication directory (supports ~ for home directory)
   auth-dir: "~/.cli-proxy-api"
 
+  # Dedicated proxy for management WebUI / OAuth auth-url bootstrap (token exchange
+  # and mandatory account bootstrap). Used when the start request does not include
+  # a per-session proxy_url. Persisted onto newly saved credentials as proxy_url.
+  # Does NOT set requests.proxy-url — keep the global proxy empty when unrelated
+  # API-key / openai-compatible providers must retain their intended egress.
+  # Prefer this over putting proxy userinfo on the process command line (-login-proxy
+  # remains available for one-shot CLI logins such as -antigravity-login).
+  # login-proxy: "http://user:pass@127.0.0.1:7890"
+
   # Core auth auto-refresh and manual refresh-all worker pool size (OAuth/file-based auth token refresh).
   # When > 0, overrides the default worker count (16).
   # auth-auto-refresh-workers: 16
