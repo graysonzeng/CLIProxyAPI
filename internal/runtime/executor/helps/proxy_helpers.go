@@ -43,6 +43,15 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	// Priority: request override, then auth.ProxyURL, then cfg.ProxyURL.
 	proxyURL := effectiveProxyURL(ctx, cfg, auth)
 
+	failClosed := cfg != nil && cfg.ProxyFailClosed
+	if failClosed {
+		if reason := httpProxyFailClosedReason(proxyURL); reason != "" {
+			log.Errorf("proxy fail-closed: %s", reason)
+			httpClient.Transport = proxyutil.NewFailClosedTransport(reason)
+			return httpClient
+		}
+	}
+
 	// Priority 1 & 2: Explicit proxy URL takes precedence over context RoundTripper.
 	if proxyURL != "" {
 		if transport := pooledProxyTransport(proxyURL, cfg, auth); transport != nil {
@@ -51,6 +60,12 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		}
 		// If proxy setup failed, log and fall through to context RoundTripper
 		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyutil.Redact(proxyURL))
+		if failClosed {
+			reason := "proxy transport build failed"
+			log.Errorf("proxy fail-closed: %s", reason)
+			httpClient.Transport = proxyutil.NewFailClosedTransport(reason)
+			return httpClient
+		}
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
@@ -608,4 +623,8 @@ func buildProxyTransport(proxyURL string) *http.Transport {
 		return nil
 	}
 	return transport
+}
+
+func httpProxyFailClosedReason(proxyURL string) string {
+	return proxyutil.HTTPFailClosedReason(proxyURL)
 }
