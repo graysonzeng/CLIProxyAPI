@@ -209,6 +209,39 @@ GET /v8/management/oauth/auth-url?provider=codex
 Authorization: Bearer <management-key>
 ```
 
+### Login proxy (management bootstrap)
+
+When `requests.proxy-fail-closed` is true and `requests.proxy-url` is intentionally
+empty (so unrelated API-key providers keep their direct egress), management OAuth
+token exchange still needs an explicit proxy for providers that cannot reach Google
+or other IdPs directly. Configure a dedicated login proxy in YAML:
+
+```yaml
+oauth:
+  login-proxy: "http://user:pass@127.0.0.1:7890"
+```
+
+`oauth.login-proxy` applies to management `auth-url` / token exchange / mandatory
+account bootstrap for every built-in and plugin provider when the start request
+does not include a per-session `proxy_url`. It is written into the newly saved
+credential as `proxy_url`. It never sets or replaces `requests.proxy-url`.
+
+Optional per-session override (POST body only; query `proxy_url` is rejected):
+
+```http
+POST /v8/management/oauth/auth-url
+Authorization: Bearer <management-key>
+Content-Type: application/json
+
+{"provider":"antigravity","is_webui":true,"proxy_url":"http://user:pass@127.0.0.1:7890"}
+```
+
+Prefer `oauth.login-proxy` in config so the management UI can keep sending only
+`provider` + `is_webui` without persisting proxy secrets in the browser. The CLI
+`-login-proxy` flag remains for one-shot logins (`-antigravity-login`, etc.) and
+does not configure the long-running management WebUI path. Invalid dedicated or
+session proxies are rejected fail-closed (no direct fallback).
+
 Keep any provider-specific login parameters in the query string. To target recovery
 at a specific existing credential, pass `name` (or `auth_index`) via query parameter
 or POST JSON body; authenticating a different account will be rejected rather than
